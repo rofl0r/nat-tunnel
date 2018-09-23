@@ -34,12 +34,15 @@ class Tunnel():
 			except:
 				buf = ''
 			if len(buf) == 0:
-				self._cleanup()
 				break
-			if a[0] == self.fds:
-				self.fdc.send(buf)
-			else:
-				self.fds.send(buf)
+			try:
+				if a[0] == self.fds:
+					self.fdc.send(buf)
+				else:
+					self.fds.send(buf)
+			except:
+				break
+		self._cleanup()
 		self.done.set()
 	def start(self):
 		self.t = threading.Thread(target=self._threadfunc)
