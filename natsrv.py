@@ -86,7 +86,7 @@ class NATClient():
 					i += 1
 
 			l = self.controlsock.recvline()
-			print _timestamp() + l.rstrip('\n')
+			print(_timestamp() + l.rstrip('\n'))
 			if l.startswith('CONN:'):
 				addr=l.rstrip('\n').split(':')[1]
 				local_conn = rocksock.Rocksock(host=self.localserv_ip, port=self.localserv_port)
@@ -154,15 +154,15 @@ class NATSrv():
 			if self.control_socket:
 				self.control_socket.close()
 			self.control_socket = conn
-			print "OK (admin)"
+			print("OK (admin)")
 		elif cmd == _hash('skt' + self.secret + nonce):
-			print "OK (tunnel)"
+			print("OK (tunnel)")
 			if not self.control_socket:
 				conn.close()
 			else:
 				self.next_upstream_socket = conn
 		else:
-			print "rejected!"
+			print("rejected!")
 			conn.close()
 
 	def wait_conn_client(self):
@@ -189,12 +189,12 @@ class NATSrv():
 			if self.control_socket and self.next_upstream_socket:
 				a,b,c = select.select([self.sc, self.control_socket, ], [], [])
 				if self.control_socket in a:
-					print "lost control socket"
+					print("lost control socket")
 					self.control_socket.close()
 					self.control_socket = None
 					continue
 				if self.next_upstream_socket in a:
-					print "lost spare upstream socket"
+					print("lost spare upstream socket")
 					self.next_upstream_socket.close()
 					self.next_upstream_socket = None
 					continue
@@ -238,7 +238,7 @@ if __name__ == "__main__":
 		"    %s --mode client --secret s3cretP4ss --local localhost:80 --admin example.com:8000\n"
 	) % (sys.argv[0], sys.argv[0])
 	if len(sys.argv) < 2 or (sys.argv[1] == '-h' or sys.argv[1] == '--help'):
-		print desc
+		print(desc)
 	parser = argparse.ArgumentParser(description='')
 	parser.add_argument('--secret', help='shared secret between natserver/client', type=str, default='', required=True)
 	parser.add_argument('--mode', help='work mode: server or client', type=str, default='server', required=True)
