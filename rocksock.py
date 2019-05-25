@@ -59,10 +59,10 @@ class RocksockException(Exception):
 	def reraise(self):
 		import sys
 		ei = sys.exc_info()
-		raise ei[0], ei[1], ei[2]
+		raise(ei[0], ei[1], ei[2])
 #		import traceback, sys
 #		traceback.print_exc(file=sys.stderr)
-#		raise self
+#		raise(self)
 
 	def get_errormessage(self):
 		errordict = {
@@ -167,7 +167,7 @@ class Rocksock():
 		try:
 			x = af+1
 		except TypeError:
-			raise RocksockException(-3, "unexpected problem resolving DNS, try again", errortype=RS_ET_GAI)
+			raise(RocksockException(-3, "unexpected problem resolving DNS, try again", errortype=RS_ET_GAI))
 #			print "GOT A WEIRD AF"
 #			print af
 #			raise RocksockException(-6666, af, errortype=RS_ET_GAI)
@@ -177,9 +177,9 @@ class Rocksock():
 		try:
 			self.sock.connect((sa[0], sa[1]))
 		except socket.timeout:
-			raise RocksockException(RS_E_HIT_TIMEOUT)
+			raise(RocksockException(RS_E_HIT_TIMEOUT))
 		except socket.error as e:
-			raise RocksockException(e.errno, errortype=RS_ET_SYS)
+			raise(RocksockException(e.errno, errortype=RS_ET_SYS))
 
 		for pnum in xrange(1, len(self.proxychain)):
 			curr = self.proxychain[pnum]
@@ -192,11 +192,11 @@ class Rocksock():
 			except ssl.SSLError as e:
 				reason = self._get_ssl_exception_reason(e)
 				#if hasattr(e, 'library'): subsystem = e.library
-				raise RocksockException(RS_E_SSL_GENERIC, reason, errortype=RS_ET_SSL)
+				raise(RocksockException(RS_E_SSL_GENERIC, reason, errortype=RS_ET_SSL))
 			except socket.error as e:
-				raise RocksockException(e.errno, errortype=RS_ET_SYS)
+				raise(RocksockException(e.errno, errortype=RS_ET_SYS))
 			except Exception as e:
-				raise e
+				raise(e)
 			"""
 			while True:
 				try:
@@ -223,7 +223,7 @@ class Rocksock():
 
 	def send(self, buf):
 		if self.sock is None:
-			raise RocksockException(RS_E_NO_SOCKET)
+			raise(RocksockException(RS_E_NO_SOCKET))
 		return self.sock.sendall(buf)
 
 	def _get_ssl_exception_reason(self, e):
@@ -241,15 +241,15 @@ class Rocksock():
 				if n >= 1024*1024: n = 1024*1024
 				chunk = self.sock.recv(n)
 			except socket.timeout:
-				raise RocksockException(RS_E_HIT_TIMEOUT)
+				raise(RocksockException(RS_E_HIT_TIMEOUT))
 			except ssl.SSLError as e:
 				s = self._get_ssl_exception_reason(e)
 				if s == 'The read operation timed out':
-					raise RocksockException(RS_E_HIT_READTIMEOUT)
+					raise(RocksockException(RS_E_HIT_READTIMEOUT))
 				else:
-					raise RocksockException(RS_E_SSL_GENERIC, s, errortype=RS_ET_SSL)
+					raise(RocksockException(RS_E_SSL_GENERIC, s, errortype=RS_ET_SSL))
 			if len(chunk) == 0:
-				raise RocksockException(RS_E_REMOTE_DISCONNECTED)
+				raise(RocksockException(RS_E_REMOTE_DISCONNECTED))
 			data += chunk
 			if count == -1: break
 			else: count -= len(chunk)
@@ -293,7 +293,7 @@ class Rocksock():
 
 		except socket.gaierror as e:
 			eno, str = e.args
-			raise RocksockException(eno, str, errortype=RS_ET_GAI)
+			raise(RocksockException(eno, str, errortype=RS_ET_GAI))
 
 		return None, None
 
@@ -318,7 +318,7 @@ class Rocksock():
 			buf += '\0\0\0\x01'
 		else:
 			af, sa = self._resolve(dest, True)
-			if af != socket.AF_INET: raise RocksockException(RS_E_SOCKS4_NO_IP6)
+			if af != socket.AF_INET: raise(RocksockException(RS_E_SOCKS4_NO_IP6))
 			buf += self._ip_to_bytes(sa[0])
 		buf += '\0'
 		if v4a: buf += dest.hostinfo.host + '\0'
@@ -328,16 +328,16 @@ class Rocksock():
 		self.send(header)
 		res = self.recv(8)
 		if len(res) < 8 or ord(res[0]) != 0:
-			raise RocksockException(RS_E_PROXY_UNEXPECTED_RESPONSE, pnum-1)
+			raise(RocksockException(RS_E_PROXY_UNEXPECTED_RESPONSE, pnum-1))
 		ch = ord(res[1])
 		if ch == 0x5a:
 			pass
 		elif ch == 0x5b:
-			raise RocksockException(RS_E_TARGETPROXY_CONNECT_FAILED, pnum-1)
+			raise(RocksockException(RS_E_TARGETPROXY_CONNECT_FAILED, pnum-1))
 		elif ch == 0x5c or ch == 0x5d:
 			return RocksockException(RS_E_PROXY_AUTH_FAILED, pnum-1)
 		else:
-			raise RocksockException(RS_E_PROXY_UNEXPECTED_RESPONSE, pnum-1)
+			raise(RocksockException(RS_E_PROXY_UNEXPECTED_RESPONSE, pnum-1))
 
 	def _setup_socks5_header(self, proxy):
 		buf = '\x05'
@@ -351,9 +351,9 @@ class Rocksock():
 		self.send(header)
 		res = self.recv(2)
 		if len(res) != 2 or res[0] != '\x05':
-			raise RocksockException(RS_E_PROXY_UNEXPECTED_RESPONSE, pnum-1)
+			raise(RocksockException(RS_E_PROXY_UNEXPECTED_RESPONSE, pnum-1))
 		if res[1] == '\xff':
-			raise RocksockException(RS_E_PROXY_AUTH_FAILED, pnum-1)
+			raise(RocksockException(RS_E_PROXY_AUTH_FAILED, pnum-1))
 
 		if ord(res[1]) == 2:
 			px = self.proxychain[pnum-1]
@@ -362,8 +362,8 @@ class Rocksock():
 				self.send(pkt)
 				res = self.recv(2)
 				if len(res) < 2 or res[1] != '\0':
-					raise RocksockException(RS_E_PROXY_AUTH_FAILED, pnum-1)
-			else: raise RocksockException(RS_E_PROXY_AUTH_FAILED, pnum-1)
+					raise(RocksockException(RS_E_PROXY_AUTH_FAILED, pnum-1))
+			else: raise(RocksockException(RS_E_PROXY_AUTH_FAILED, pnum-1))
 		dst = self.proxychain[pnum]
 		numeric = self._isnumericipv4(dst.hostinfo.host)
 		if numeric:
@@ -375,18 +375,18 @@ class Rocksock():
 		self.send(pkt)
 		res = self.recv()
 		if len(res) < 2 or res[0] != '\x05':
-			raise RocksockException(RS_E_PROXY_UNEXPECTED_RESPONSE, pnum-1)
+			raise(RocksockException(RS_E_PROXY_UNEXPECTED_RESPONSE, pnum-1))
 		ch = ord(res[1])
 		if ch == 0: pass
-		elif ch == 1: raise RocksockException(RS_E_PROXY_GENERAL_FAILURE, pnum-1)
-		elif ch == 2: raise RocksockException(RS_E_PROXY_AUTH_FAILED, pnum-1)
-		elif ch == 3: raise RocksockException(RS_E_TARGETPROXY_NET_UNREACHABLE, pnum-1)
-		elif ch == 4: raise RocksockException(RS_E_TARGETPROXY_HOST_UNREACHABLE, pnum-1)
-		elif ch == 5: raise RocksockException(RS_E_TARGETPROXY_CONN_REFUSED, pnum-1)
-		elif ch == 6: raise RocksockException(RS_E_TARGETPROXY_TTL_EXPIRED, pnum-1)
-		elif ch == 7: raise RocksockException(RS_E_PROXY_COMMAND_NOT_SUPPORTED, pnum-1)
-		elif ch == 8: raise RocksockException(RS_E_PROXY_ADDRESSTYPE_NOT_SUPPORTED, pnum-1)
-		else: raise RocksockException(RS_E_PROXY_UNEXPECTED_RESPONSE, pnum-1)
+		elif ch == 1: raise(RocksockException(RS_E_PROXY_GENERAL_FAILURE, pnum-1))
+		elif ch == 2: raise(RocksockException(RS_E_PROXY_AUTH_FAILED, pnum-1))
+		elif ch == 3: raise(RocksockException(RS_E_TARGETPROXY_NET_UNREACHABLE, pnum-1))
+		elif ch == 4: raise(RocksockException(RS_E_TARGETPROXY_HOST_UNREACHABLE, pnum-1))
+		elif ch == 5: raise(RocksockException(RS_E_TARGETPROXY_CONN_REFUSED, pnum-1))
+		elif ch == 6: raise(RocksockException(RS_E_TARGETPROXY_TTL_EXPIRED, pnum-1))
+		elif ch == 7: raise(RocksockException(RS_E_PROXY_COMMAND_NOT_SUPPORTED, pnum-1))
+		elif ch == 8: raise(RocksockException(RS_E_PROXY_ADDRESSTYPE_NOT_SUPPORTED, pnum-1))
+		else: raise(RocksockException(RS_E_PROXY_UNEXPECTED_RESPONSE, pnum-1))
 
 
 	def _connect_step(self, pnum):
@@ -400,7 +400,7 @@ class Rocksock():
 				if e.get_error() == RS_E_TARGETPROXY_CONNECT_FAILED:
 					s4 = self._setup_socks4_header(self, False, curr)
 					self._connect_socks4(s4a, pnum)
-				else: raise e
+				else: raise(e)
 		elif prev.type == RS_PT_SOCKS5:
 			s5 = self._setup_socks5_header(prev)
 			self._connect_socks5(s5, pnum)
@@ -409,9 +409,9 @@ class Rocksock():
 			self.send("CONNECT %s:%d HTTP/1.1\r\n\r\n"%(dest.hostinfo.host, dest.hostinfo.port))
 			resp = self.recv()
 			if len(resp) <12:
-				raise RocksockException(RS_E_PROXY_UNEXPECTED_RESPONSE, pnum-1)
+				raise(RocksockException(RS_E_PROXY_UNEXPECTED_RESPONSE, pnum-1))
 			if resp[9] != '2':
-				raise RocksockException(RS_E_TARGETPROXY_CONNECT_FAILED, pnum-1)
+				raise(RocksockException(RS_E_TARGETPROXY_CONNECT_FAILED, pnum-1))
 
 
 if __name__ == '__main__':
@@ -426,12 +426,12 @@ if __name__ == '__main__':
 	try:
 		rs.connect()
 	except RocksockException as e:
-		print e.get_errormessage()
+		print(e.get_errormessage())
 		e.reraise()
 	rs.send('GET / HTTP/1.0\r\n\r\n')
-	print rs.recvline()
+	print(rs.recvline())
 	rs.disconnect()
 	rs.connect()
 	rs.send('GET / HTTP/1.0\r\n\r\n')
-	print rs.recvline()
+	print(rs.recvline())
 
