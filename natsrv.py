@@ -6,7 +6,7 @@ def _get_nonce():
 	return os.urandom(NONCE_LEN).encode('hex')
 
 def _hash(str):
-	return hashlib.sha256(str).hexdigest()
+	return hashlib.sha256(str.encode('utf-8')).hexdigest()
 
 def _format_addr(addr):
 	ip, port = addr
