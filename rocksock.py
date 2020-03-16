@@ -239,7 +239,7 @@ class Rocksock():
 		except socket.error as e:
 			raise(self._translate_socket_error(e, 0))
 
-		for pnum in xrange(1, len(self.proxychain)):
+		for pnum in range(1, len(self.proxychain)):
 			curr = self.proxychain[pnum]
 			prev = self.proxychain[pnum-1]
 			self._connect_step(pnum)
