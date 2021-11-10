@@ -1,19 +1,29 @@
-import socket, select, os, threading, hashlib, rocksock, time, sys
+from __future__ import print_function
+import socket, select, os, threading, hashlib, rocksock, time, sys, codecs
+
+PY3 = sys.version_info[0] == 3
+if PY3:
+	def _b(a, b):
+		return bytes(a, b)
+else:
+	def _b(a, b):
+		return bytes(a)
 
 NONCE_LEN = 8
 
 def _get_nonce():
-	return os.urandom(NONCE_LEN).encode('hex')
+	return codecs.encode(os.urandom(NONCE_LEN), 'hex')
 
 def _hash(str):
-	return hashlib.sha256(str).hexdigest()
+	return _b(hashlib.sha256(str).hexdigest(), 'utf-8')
 
 def _format_addr(addr):
 	ip, port = addr
-	return "%s:%d"%(ip, port)
+	ip = _b(ip, 'utf-8')
+	return b"%s:%d"%(ip, port)
 
 def _timestamp():
-	return time.strftime('[%Y-%m-%d %H:%M:%S] ', time.localtime(time.time()))
+	return _b(time.strftime('[%Y-%m-%d %H:%M:%S] ', time.localtime(time.time())), 'utf-8')
 
 class Tunnel():
 	def __init__(self, fds, fdc, caddr):
@@ -67,13 +77,13 @@ class NATClient():
 	def _setup_sock(self, cmd):
 		sock = rocksock.Rocksock(host=self.upstream_ip, port=self.upstream_port)
 		sock.connect()
-		nonce = sock.recv(NONCE_LEN*2 + 1).rstrip('\n')
-		sock.send(_hash(cmd + self.secret + nonce) + '\n')
+		nonce = sock.recv(NONCE_LEN*2 + 1).rstrip(b'\n')
+		sock.send(_hash(cmd + self.secret + nonce) + b'\n')
 		return sock
 
 	def setup(self):
-		self.controlsock = self._setup_sock('adm')
-		self.next_csock =  self._setup_sock('skt')
+		self.controlsock = self._setup_sock(b'adm')
+		self.next_csock =  self._setup_sock(b'skt')
 
 	def doit(self):
 		while True:
@@ -86,15 +96,15 @@ class NATClient():
 					i += 1
 
 			l = self.controlsock.recvline()
-			print(_timestamp() + l.rstrip('\n'))
-			if l.startswith('CONN:'):
-				addr=l.rstrip('\n').split(':')[1]
+			print(_timestamp() + l.rstrip(b'\n'))
+			if l.startswith(b'CONN:'):
+				addr=l.rstrip(b'\n').split(b':')[1]
 				local_conn = rocksock.Rocksock(host=self.localserv_ip, port=self.localserv_port)
 				local_conn.connect()
 				thread = Tunnel(local_conn.sock, self.next_csock.sock, addr)
 				thread.start()
 				self.threads.append(thread)
-				self.next_csock = self._setup_sock('skt')
+				self.next_csock = self._setup_sock(b'skt')
 
 
 class NATSrv():
@@ -130,7 +140,7 @@ class NATSrv():
 		self.sc = None
 		self.control_socket = None
 		self.next_upstream_socket = None
-		self.hashlen = len(_hash(""))
+		self.hashlen = len(_hash(b''))
 
 	def _setup_listen_socket(self, listenip, port):
 		af, sa = self._resolve(listenip, port)
@@ -147,15 +157,15 @@ class NATSrv():
 	def wait_conn_up(self):
 		conn, addr = self.su.accept()
 		nonce = _get_nonce()
-		sys.stdout.write(_timestamp() + "CONN: %s (nonce: %s) ... "%(_format_addr(addr), nonce))
-		conn.send(nonce + '\n')
-		cmd = conn.recv(1 + self.hashlen).rstrip('\n')
-		if cmd == _hash('adm' + self.secret + nonce):
+		print(_timestamp() + b"CONN: %s (nonce: %s) ... "%(_format_addr(addr), nonce), end='')
+		conn.send(nonce + b'\n')
+		cmd = conn.recv(1 + self.hashlen).rstrip(b'\n')
+		if cmd == _hash(b'adm' + self.secret + nonce):
 			if self.control_socket:
 				self.control_socket.close()
 			self.control_socket = conn
 			print("OK (admin)")
-		elif cmd == _hash('skt' + self.secret + nonce):
+		elif cmd == _hash(b'skt' + self.secret + nonce):
 			print("OK (tunnel)")
 			if not self.control_socket:
 				conn.close()
@@ -167,7 +177,7 @@ class NATSrv():
 
 	def wait_conn_client(self):
 		conn, addr = self.sc.accept()
-		self.control_socket.send("CONN:%s\n"%_format_addr(addr))
+		self.control_socket.send(b"CONN:%s\n"%_format_addr(addr))
 		thread = Tunnel(self.next_upstream_socket, conn, addr)
 		thread.start()
 		self.threads.append(thread)
@@ -249,11 +259,11 @@ if __name__ == "__main__":
 	adminip, adminport = args.admin.split(':')
 	if args.mode == 'server':
 		clientip, clientport = args.public.split(':')
-		srv = NATSrv(args.secret, adminip, int(adminport), clientip, int(clientport))
+		srv = NATSrv(_b(args.secret, 'utf-8'), adminip, int(adminport), clientip, int(clientport))
 		srv.setup()
 		srv.doit()
 	else:
 		localip, localport = args.local.split(':')
-		cl = NATClient(args.secret, adminip, int(adminport), localip, int(localport))
+		cl = NATClient(_b(args.secret, 'utf-8'), adminip, int(adminport), localip, int(localport))
 		cl.setup()
 		cl.doit()

@@ -295,7 +295,7 @@ class Rocksock():
 		return s
 
 	def recv(self, count=-1, pnum=-1):
-		data = ''
+		data = b''
 		while count:
 			try:
 				n = count if count != -1 else 4096
@@ -319,9 +319,9 @@ class Rocksock():
 		return data
 
 	def recvline(self):
-		s = ''
-		c = '\0'
-		while c != '\n':
+		s = b''
+		c = b'\0'
+		while c != b'\n':
 			c = self.recv(1)
 			if c == '': return s
 			s += c
