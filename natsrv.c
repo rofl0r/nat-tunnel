@@ -231,10 +231,13 @@ struct tunnel {
    tunnel_reap and tunnel_start below. */
 static void *tunnel_thread(void *data) {
 	struct tunnel *t = data;
+	int open0 = 1, open1 = 1;
 	struct pollfd fds[2];
 	fds[0].fd = t->fds; fds[0].events = POLLIN; fds[0].revents = 0;
 	fds[1].fd = t->fdc; fds[1].events = POLLIN; fds[1].revents = 0;
-	while(1) {
+	while(open0 || open1) {
+		fds[0].fd = open0 ? t->fds : -1;
+		fds[1].fd = open1 ? t->fdc : -1;
 		int r = poll(fds, 2, -1);
 		if(r < 0) {
 			if(errno == EINTR) continue;
@@ -242,11 +245,25 @@ static void *tunnel_thread(void *data) {
 		}
 		if(!((fds[0].revents | fds[1].revents) & (POLLIN|POLLERR|POLLHUP|POLLNVAL))) break;
 		int infd = (fds[0].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) ? t->fds : t->fdc;
-		if(!(fds[0].revents & POLLIN) && !(fds[1].revents & POLLIN)) break;
 		int outfd = (infd == t->fds) ? t->fdc : t->fds;
+		if(!(fds[0].revents & POLLIN) && !(fds[1].revents & POLLIN)) {
+			if(infd == t->fds) open0 = 0;
+			else open1 = 0;
+			shutdown(outfd, SHUT_WR);
+			continue;
+		}
 		char buf[BUFSZ];
 		ssize_t n = recv(infd, buf, sizeof buf, 0);
-		if(n <= 0) break;
+		if(n < 0) {
+			if(errno == EINTR) continue;
+			n = 0;
+		}
+		if(n == 0) {
+			if(infd == t->fds) open0 = 0;
+			else open1 = 0;
+			shutdown(outfd, SHUT_WR);
+			continue;
+		}
 		size_t sent = 0;
 		int failed = 0;
 		while(sent < (size_t)n) {
