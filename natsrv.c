@@ -222,6 +222,13 @@ struct tunnel {
 	volatile int done;
 };
 
+/* Tunnel threads are heap allocated and the list stores pointers to
+   them (microsocks pattern). The old code stored structs by value in
+   a realloc'd array and passed &threads[i] to the thread: a later
+   realloc could move the array, and the reap loop's swap-with-last
+   copy could overwrite an element, so a running thread wrote done
+   and fds through a stale or moved pointer. See tunnel_add,
+   tunnel_reap and tunnel_start below. */
 static void *tunnel_thread(void *data) {
 	struct tunnel *t = data;
 	struct pollfd fds[2];
@@ -261,11 +268,44 @@ static void *tunnel_thread(void *data) {
 	return 0;
 }
 
-static int tunnel_start(struct tunnel *t, int fds, int fdc) {
+static int tunnel_start(struct tunnel **slot, int fds, int fdc) {
+	struct tunnel *t = malloc(sizeof *t);
+	if(!t) return -1;
 	t->fds = fds;
 	t->fdc = fdc;
 	t->done = 0;
-	return pthread_create(&t->pt, 0, tunnel_thread, t);
+	if(pthread_create(&t->pt, 0, tunnel_thread, t) != 0) {
+		free(t);
+		return -1;
+	}
+	*slot = t;
+	return 0;
+}
+
+static void tunnel_reap(struct tunnel ***arr, size_t *count) {
+	size_t i = 0;
+	while(i < *count) {
+		struct tunnel *t = (*arr)[i];
+		if(t->done) {
+			pthread_join(t->pt, 0);
+			(*arr)[i] = (*arr)[*count - 1];
+			(*count)--;
+			free(t);
+		} else i++;
+	}
+}
+
+static int tunnel_add(struct tunnel ***arr, size_t *count, size_t *cap, int fds, int fdc) {
+	if(*count == *cap) {
+		size_t ncap = *cap ? *cap * 2 : 8;
+		struct tunnel **nt = realloc(*arr, ncap * sizeof *nt);
+		if(!nt) return -1;
+		*arr = nt;
+		*cap = ncap;
+	}
+	if(tunnel_start(&(*arr)[*count], fds, fdc) != 0) return -1;
+	(*count)++;
+	return 0;
 }
 
 /* ---- NAT client ---- */
@@ -308,17 +348,10 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 	if(control < 0) return;
 	int next = client_setup_sock(upstream_ip, upstream_port, "skt");
 	if(next < 0) { close(control); return; }
-	struct tunnel *threads = 0;
+	struct tunnel **threads = 0;
 	size_t nthreads = 0, capthreads = 0;
 	while(1) {
-		size_t i = 0;
-		while(i < nthreads) {
-			if(threads[i].done) {
-				pthread_join(threads[i].pt, 0);
-				threads[i] = threads[nthreads-1];
-				nthreads--;
-			} else i++;
-		}
+		tunnel_reap(&threads, &nthreads);
 		char line[4096];
 		size_t linelen = 0;
 		if(recv_line(control, line, sizeof line, &linelen) < 0) {
@@ -352,18 +385,10 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 				   and program dies. To stay close, we do NOT replace next. */
 				continue;
 			}
-			if(nthreads == capthreads) {
-				size_t ncap = capthreads ? capthreads*2 : 8;
-				struct tunnel *nt = realloc(threads, ncap * sizeof *nt);
-				if(!nt) { close(local); close(next); return; }
-				threads = nt;
-				capthreads = ncap;
-			}
-			if(tunnel_start(&threads[nthreads], local, next) != 0) {
+			if(tunnel_add(&threads, &nthreads, &capthreads, local, next) < 0) {
 				close(local); close(next);
 				continue;
 			}
-			nthreads++;
 			next = client_setup_sock(upstream_ip, upstream_port, "skt");
 			if(next < 0) break;
 		}
@@ -427,17 +452,10 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 	if(sc < 0) { perror("listen public"); return; }
 	int control = -1;
 	int next_up = -1;
-	struct tunnel *threads = 0;
+	struct tunnel **threads = 0;
 	size_t nthreads = 0, capthreads = 0;
 	while(1) {
-		size_t i = 0;
-		while(i < nthreads) {
-			if(threads[i].done) {
-				pthread_join(threads[i].pt, 0);
-				threads[i] = threads[nthreads-1];
-				nthreads--;
-			} else i++;
-		}
+		tunnel_reap(&threads, &nthreads);
 		if(control < 0) server_wait_conn_up(su, &control, &next_up);
 		if(next_up < 0) server_wait_conn_up(su, &control, &next_up);
 		if(control >= 0 && next_up >= 0) {
@@ -480,19 +498,11 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 					close(conn);
 					continue;
 				}
-				if(nthreads == capthreads) {
-					size_t ncap = capthreads ? capthreads*2 : 8;
-					struct tunnel *nt = realloc(threads, ncap * sizeof *nt);
-					if(!nt) { close(conn); continue; }
-					threads = nt;
-					capthreads = ncap;
-				}
-				if(tunnel_start(&threads[nthreads], next_up, conn) != 0) {
+				if(tunnel_add(&threads, &nthreads, &capthreads, next_up, conn) < 0) {
 					close(next_up); close(conn);
 					next_up = -1;
 					continue;
 				}
-				nthreads++;
 				next_up = -1;
 			}
 		}
