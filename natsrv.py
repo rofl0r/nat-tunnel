@@ -37,22 +37,36 @@ class Tunnel():
 		self.fdc = None
 		self.fds = None
 	def _threadfunc(self):
-		while True:
-			a,b,c = select.select([self.fds, self.fdc], [], [])
+		# Half-close bug: any EOF (or recv error) broke the loop and
+		# closed both sockets at once, discarding data still in
+		# flight in the other direction. Now EOF on one side only
+		# shutdown()s that side's write half; the other direction
+		# keeps draining until it also reaches EOF, then close.
+		open_dirs = {self.fds, self.fdc}
+		while open_dirs:
+			try:
+				a,b,c = select.select(list(open_dirs), [], [])
+			except (ValueError, OSError):
+				break
+			if not a:
+				continue
+			other = {self.fds: self.fdc, self.fdc: self.fds}[a[0]]
 			try:
 				buf = a[0].recv(1024)
-			except:
-				buf = ''
+			except (ConnectionResetError, OSError):
+				buf = b''
 			if len(buf) == 0:
-				break
+				open_dirs.discard(a[0])
+				try:
+					other.shutdown(socket.SHUT_WR)
+				except OSError:
+					pass
+				continue
 			try:
 				# send() may write only part of buf; old code dropped
 				# the rest silently. sendall() writes all of it.
-				if a[0] == self.fds:
-					self.fdc.sendall(buf)
-				else:
-					self.fds.sendall(buf)
-			except:
+				other.sendall(buf)
+			except (BrokenPipeError, ConnectionResetError, OSError):
 				break
 		self._cleanup()
 		self.done.set()
