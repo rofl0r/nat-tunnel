@@ -212,6 +212,9 @@ static void format_addr(const struct sockaddr_in *a, char *out, size_t cap) {
 	char ip[INET_ADDRSTRLEN];
 	const char *s = inet_ntop(AF_INET, &a->sin_addr, ip, sizeof ip);
 	if(!s) s = "?";
+	/* IPv4 wire format is unchanged (ip:port). IPv6 peers send
+	   [addr]:port; this C server is still v4-only for listen,
+	   so no brackets are emitted here yet. */
 	snprintf(out, cap, "%s:%u", s, (unsigned)ntohs(a->sin_port));
 }
 
@@ -399,17 +402,19 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 		if(linelen && line[linelen-1] != '\n') fputc('\n', stdout);
 		fflush(stdout);
 		if(strncmp(line, "CONN:", 5) == 0) {
-			/* python: addr = line.rstrip('\n').split(':')[1]
-			   note: for IPv6 this would break too; keep same logic for v4.
-			   line is "CONN:ip:port\n" -> after first ':' is ip, second ':' port.
-			   Actually split(':')[1] gives ip part only in python? Wait:
-			   "CONN:1.2.3.4:1234".split(':') -> [CONN, 1.2.3.4, 1234], [1]=ip.
-			   But Tunnel addr is unused except stored. So we keep same: parse ip. */
+			/* Parse CONN:ip:port or CONN:[v6]:port (matches py fix).
+			   Address is unused beyond this in both programs. */
 			char *p = line + 5;
-			char *colon = strchr(p, ':');
-			if(!colon) continue;
-			*colon = 0;
-			/* addr unused beyond this in python; local_conn ignores it */
+			if(*p == '[') {
+				char *rb = strchr(p, ']');
+				if(!rb) continue;
+				*rb = 0;
+				if(!strchr(rb+1, ':')) continue;
+			} else {
+				char *colon = strchr(p, ':');
+				if(!colon) continue;
+				*colon = 0;
+			}
 			int local = connect_to(local_ip, local_port);
 			if(local < 0) {
 				perror("connect local");
