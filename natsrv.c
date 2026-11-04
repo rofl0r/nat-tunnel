@@ -56,12 +56,15 @@ static void get_nonce(char out[NONCE_HEX_LEN+1]) {
 			got += (size_t)r;
 		}
 		close(fd);
-		if(got != NONCE_LEN)
-			memset(raw, 0, sizeof raw);
+		if(got != NONCE_LEN) {
+			/* No fallback: rand() seeded with time+pid is
+			   predictable and not secure. Fail closed. */
+			perror("read /dev/urandom");
+			exit(1);
+		}
 	} else {
-		srand((unsigned)(time(NULL) ^ (long)getpid()));
-		size_t i;
-		for(i=0;i<NONCE_LEN;i++) raw[i] = (unsigned char)rand();
+		perror("open /dev/urandom");
+		exit(1);
 	}
 	hex_encode(raw, NONCE_LEN, out);
 }
