@@ -46,10 +46,12 @@ class Tunnel():
 			if len(buf) == 0:
 				break
 			try:
+				# send() may write only part of buf; old code dropped
+				# the rest silently. sendall() writes all of it.
 				if a[0] == self.fds:
-					self.fdc.send(buf)
+					self.fdc.sendall(buf)
 				else:
-					self.fds.send(buf)
+					self.fds.sendall(buf)
 			except:
 				break
 		self._cleanup()
