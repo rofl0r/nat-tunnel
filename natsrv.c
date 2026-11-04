@@ -372,11 +372,27 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 		tunnel_reap(&threads, &nthreads);
 		char line[4096];
 		size_t linelen = 0;
-		if(recv_line(control, line, sizeof line, &linelen) < 0) {
-			/* python recvline would raise / loop would crash; in C we must
-			   decide. Python: Rocksock.recv raises on EOF, uncaught -> exit.
-			   Keep old behaviour of terminating on lost control. */
-			break;
+		if(recv_line(control, line, sizeof line, &linelen) < 0 || !linelen || line[linelen-1] != '\n') {
+			/* Lost control (matches py fix): old C code broke out
+			   and exited, killing all tunnels. Tear down control+
+			   spare and re-handshake with backoff. */
+			printf("lost control socket, reconnecting\n");
+			fflush(stdout);
+			close(control);
+			if(next >= 0) close(next);
+			next = -1;
+			control = -1;
+			while(control < 0) {
+				struct timespec ts;
+				ts.tv_sec = 2;
+				ts.tv_nsec = 0;
+				nanosleep(&ts, 0);
+				control = client_setup_sock(upstream_ip, upstream_port, "adm");
+				if(control < 0) continue;
+				next = client_setup_sock(upstream_ip, upstream_port, "skt");
+				if(next < 0) { close(control); control = -1; }
+			}
+			continue;
 		}
 		print_timestamp();
 		fputs(line, stdout);
