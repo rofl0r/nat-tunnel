@@ -144,8 +144,30 @@ class NATClient():
 			print(_timestamp() + l.rstrip(b'\n'))
 			if l.startswith(b'CONN:'):
 				addr=l.rstrip(b'\n').split(b':')[1]
-				local_conn = rocksock.Rocksock(host=self.localserv_ip, port=self.localserv_port)
-				local_conn.connect()
+				# Local connect failure bug: old code let connect()
+				# raise, killing the client and stranding the
+				# public client that the server had paired with
+				# our spare socket. Now log it, drop the already
+				# paired spare socket (tell the server there is no
+				# spare by force-closing it; the server notices on
+				# its select), and arm a fresh spare.
+				try:
+					local_conn = rocksock.Rocksock(host=self.localserv_ip, port=self.localserv_port)
+					local_conn.connect()
+				except Exception as e:
+					print(_timestamp() + b'local connect failed: %s' % str(e).encode())
+					if self.next_csock is not None:
+						try:
+							self.next_csock.disconnect()
+						except Exception:
+							pass
+						self.next_csock = None
+					try:
+						self.next_csock = self._setup_sock(b'skt')
+					except Exception:
+						print(_timestamp() + b'lost spare socket, reconnecting')
+						self._reconnect()
+					continue
 				thread = Tunnel(local_conn.sock, self.next_csock.sock, addr)
 				thread.start()
 				self.threads.append(thread)
