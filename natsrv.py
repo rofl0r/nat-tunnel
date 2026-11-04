@@ -1,5 +1,5 @@
 from __future__ import print_function
-import socket, select, os, threading, hashlib, rocksock, time, sys, codecs
+import socket, select, os, threading, hashlib, rocksock, time, sys, codecs, re
 
 PY3 = sys.version_info[0] == 3
 if PY3:
@@ -17,8 +17,24 @@ def _get_nonce():
 def _hash(str):
 	return _b(hashlib.sha256(str).hexdigest(), 'utf-8')
 
+# CONN address format: IPv4 is "1.2.3.4:1234", IPv6 is "[::1]:1234".
+# The brackets are required: a bare IPv6 address contains colons,
+# so split(b':') cannot tell address from port. Use a pre-compiled
+# regex and strip the brackets on parse; _format_addr adds them.
+_CONN_RE = re.compile(br'CONN:\[(?P<ip>[^\]]+)\]:(?P<port>\d+)\b|CONN:(?P<ip4>\d{1,3}(?:\.\d{1,3}){3}):(?P<port4>\d+)\b')
+def _parse_conn(line):
+	# Return (ip_str, port_int) or None. Line is bytes without newline.
+	m = _CONN_RE.search(line)
+	if not m:
+		return None
+	if m.group('ip') is not None:
+		return m.group('ip').decode('utf-8', 'replace'), int(m.group('port'))
+	return m.group('ip4').decode('utf-8', 'replace'), int(m.group('port4'))
+
 def _format_addr(addr):
-	ip, port = addr
+	ip, port = addr[0], addr[1]
+	if ':' in ip:  # IPv6: wrap in brackets
+		ip = '[' + ip + ']'
 	ip = _b(ip, 'utf-8')
 	return b"%s:%d"%(ip, port)
 
@@ -143,7 +159,11 @@ class NATClient():
 				continue
 			print(_timestamp() + l.rstrip(b'\n'))
 			if l.startswith(b'CONN:'):
-				addr=l.rstrip(b'\n').split(b':')[1]
+				parsed=_parse_conn(l.rstrip(b'\n'))
+				if parsed is None:
+					print(_timestamp() + b'unparsable CONN line: %r' % l)
+					continue
+				addr=parsed
 				# Local connect failure bug: old code let connect()
 				# raise, killing the client and stranding the
 				# public client that the server had paired with
