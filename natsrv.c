@@ -76,6 +76,16 @@ static void compute_hash(const char *cmd, const char *nonce, char out[HASH_HEX_L
 	hex_encode(digest, SHA256_DIGEST_SIZE, out);
 }
 
+/* Constant-time compare (matches py hmac.compare_digest fix).
+   Old code used memcmp, which short-circuits and leaks how
+   many leading bytes matched. */
+static int ct_equal(const char *a, const char *b, size_t n) {
+	unsigned char diff = 0;
+	size_t i;
+	for(i=0;i<n;i++) diff |= (unsigned char)(a[i] ^ b[i]);
+	return diff == 0;
+}
+
 static int send_all(int fd, const void *buf, size_t len) {
 	const char *p = buf;
 	size_t sent = 0;
@@ -464,13 +474,16 @@ static int server_wait_conn_up(int su, int *control, int *next_up) {
 	while(cl > 0 && cmdbuf[cl-1] == '\n') { cmdbuf[--cl] = 0; }
 	char expect[HASH_HEX_LEN+1];
 	compute_hash("adm", nonce, expect);
-	if(cl == HASH_HEX_LEN && memcmp(cmdbuf, expect, HASH_HEX_LEN) == 0) {
+	if(cl == HASH_HEX_LEN && ct_equal(cmdbuf, expect, HASH_HEX_LEN)) {
 		if(*control >= 0) close(*control);
+		/* Orphan spare (matches py fix): old code left the
+		   spare from the dead admin session in place. */
+		if(*next_up >= 0) { close(*next_up); *next_up = -1; }
 		*control = conn;
 		printf("OK (admin)\n");
 	} else {
 		compute_hash("skt", nonce, expect);
-		if(cl == HASH_HEX_LEN && memcmp(cmdbuf, expect, HASH_HEX_LEN) == 0) {
+		if(cl == HASH_HEX_LEN && ct_equal(cmdbuf, expect, HASH_HEX_LEN)) {
 			printf("OK (tunnel)\n");
 			if(*control < 0) close(conn);
 			else {
