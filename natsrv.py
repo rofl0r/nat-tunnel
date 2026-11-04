@@ -1,5 +1,5 @@
 from __future__ import print_function
-import socket, select, os, threading, hashlib, rocksock, time, sys, codecs, re
+import socket, select, os, threading, hashlib, rocksock, time, sys, codecs, re, hmac
 
 PY3 = sys.version_info[0] == 3
 if PY3:
@@ -282,7 +282,7 @@ class NATSrv():
 		except (socket.timeout, TimeoutError, OSError):
 			cmd = b''
 		cmd = cmd.rstrip(b'\n')
-		if cmd == _hash(b'adm' + self.secret + nonce):
+		if hmac.compare_digest(cmd, _hash(b'adm' + self.secret + nonce)):
 			conn.settimeout(None)
 			if self.control_socket:
 				self.control_socket.close()
@@ -298,7 +298,7 @@ class NATSrv():
 				self.next_upstream_socket = None
 			self.control_socket = conn
 			print("OK (admin)")
-		elif cmd == _hash(b'skt' + self.secret + nonce):
+		elif hmac.compare_digest(cmd, _hash(b'skt' + self.secret + nonce)):
 			conn.settimeout(None)
 			print("OK (tunnel)")
 			if not self.control_socket:
