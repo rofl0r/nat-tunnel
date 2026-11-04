@@ -14,6 +14,10 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#ifdef HAVE_GETRANDOM
+#include <sys/random.h>
+#include <linux/random.h>
+#endif
 #include "sha256.h"
 
 #define NONCE_LEN 8
@@ -47,6 +51,29 @@ static void hex_encode(const unsigned char *in, size_t n, char *out) {
 
 static void get_nonce(char out[NONCE_HEX_LEN+1]) {
 	unsigned char raw[NONCE_LEN];
+
+#ifdef HAVE_GETRANDOM
+	/* getrandom() syscall via libc (Linux 3.17+ / glibc 2.25+).
+	   Enable with: make CPPFLAGS=-DHAVE_GETRANDOM */
+	{
+		ssize_t r;
+		size_t got = 0;
+		while(got < NONCE_LEN) {
+			r = getrandom(raw+got, NONCE_LEN-got, 0);
+			if(r < 0) {
+				if(errno == EINTR) continue;
+				perror("getrandom");
+				exit(1);
+			}
+			if(r == 0) break;
+			got += (size_t)r;
+		}
+		if(got != NONCE_LEN) {
+			perror("getrandom");
+			exit(1);
+		}
+	}
+#else
 	int fd = open("/dev/urandom", 0);
 	if(fd >= 0) {
 		size_t got = 0;
@@ -66,6 +93,7 @@ static void get_nonce(char out[NONCE_HEX_LEN+1]) {
 		perror("open /dev/urandom");
 		exit(1);
 	}
+#endif
 	hex_encode(raw, NONCE_LEN, out);
 }
 
