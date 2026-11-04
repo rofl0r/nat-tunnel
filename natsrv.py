@@ -80,7 +80,7 @@ class NATClient():
 		sock = rocksock.Rocksock(host=self.upstream_ip, port=self.upstream_port)
 		sock.connect()
 		nonce = sock.recv(NONCE_LEN*2 + 1).rstrip(b'\n')
-		sock.send(_hash(cmd + self.secret + nonce) + b'\n')
+		sock.sendall(_hash(cmd + self.secret + nonce) + b'\n')
 		return sock
 
 	def setup(self):
@@ -160,8 +160,17 @@ class NATSrv():
 		conn, addr = self.su.accept()
 		nonce = _get_nonce()
 		print(_timestamp() + b"CONN: %s (nonce: %s) ... "%(_format_addr(addr), nonce), end='')
-		conn.send(nonce + b'\n')
-		cmd = conn.recv(1 + self.hashlen).rstrip(b'\n')
+		conn.sendall(nonce + b'\n')
+		# TCP may split the hash across packets; a single recv()
+		# could return a short read and wrongly reject a good
+		# client. Read exactly hashlen+1 bytes instead.
+		cmd = b''
+		while len(cmd) < 1 + self.hashlen:
+			chunk = conn.recv(1 + self.hashlen - len(cmd))
+			if not chunk:
+				break
+			cmd += chunk
+		cmd = cmd.rstrip(b'\n')
 		if cmd == _hash(b'adm' + self.secret + nonce):
 			if self.control_socket:
 				self.control_socket.close()
@@ -179,7 +188,7 @@ class NATSrv():
 
 	def wait_conn_client(self):
 		conn, addr = self.sc.accept()
-		self.control_socket.send(b"CONN:%s\n"%_format_addr(addr))
+		self.control_socket.sendall(b"CONN:%s\n"%_format_addr(addr))
 		thread = Tunnel(self.next_upstream_socket, conn, addr)
 		thread.start()
 		self.threads.append(thread)
