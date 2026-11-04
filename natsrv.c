@@ -413,10 +413,12 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 			int local = connect_to(local_ip, local_port);
 			if(local < 0) {
 				perror("connect local");
-				/* python would raise; we drop this one tunnel and continue.
-				   next_csock must still be consumed/replaced like python does
-				   only on success path? In python the exception propagates
-				   and program dies. To stay close, we do NOT replace next. */
+				/* Local fail (matches py fix): old C code kept the
+				   paired spare socket, stranding the public client
+				   that the server had paired with it. Drop the
+				   spare, arm a fresh one, and continue. */
+				if(next >= 0) close(next);
+				next = client_setup_sock(upstream_ip, upstream_port, "skt");
 				continue;
 			}
 			if(tunnel_add(&threads, &nthreads, &capthreads, local, next) < 0) {
