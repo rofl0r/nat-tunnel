@@ -208,6 +208,12 @@ class NATSrv():
 
 	def wait_conn_up(self):
 		conn, addr = self.su.accept()
+		# Handshake blocking bug: the old code blocked in recv()
+		# below with no timeout, so a client that connected and
+		# sent nothing froze the whole server (no admin, spare,
+		# or public accepts). Pre-auth sockets now get a short
+		# timeout that is cleared once auth succeeds.
+		conn.settimeout(10)
 		nonce = _get_nonce()
 		print(_timestamp() + b"CONN: %s (nonce: %s) ... "%(_format_addr(addr), nonce), end='')
 		conn.sendall(nonce + b'\n')
@@ -215,18 +221,23 @@ class NATSrv():
 		# could return a short read and wrongly reject a good
 		# client. Read exactly hashlen+1 bytes instead.
 		cmd = b''
-		while len(cmd) < 1 + self.hashlen:
-			chunk = conn.recv(1 + self.hashlen - len(cmd))
-			if not chunk:
-				break
-			cmd += chunk
+		try:
+			while len(cmd) < 1 + self.hashlen:
+				chunk = conn.recv(1 + self.hashlen - len(cmd))
+				if not chunk:
+					break
+				cmd += chunk
+		except (socket.timeout, TimeoutError, OSError):
+			cmd = b''
 		cmd = cmd.rstrip(b'\n')
 		if cmd == _hash(b'adm' + self.secret + nonce):
+			conn.settimeout(None)
 			if self.control_socket:
 				self.control_socket.close()
 			self.control_socket = conn
 			print("OK (admin)")
 		elif cmd == _hash(b'skt' + self.secret + nonce):
+			conn.settimeout(None)
 			print("OK (tunnel)")
 			if not self.control_socket:
 				conn.close()
