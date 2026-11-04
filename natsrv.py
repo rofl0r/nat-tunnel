@@ -94,8 +94,31 @@ class NATClient():
 		sock = rocksock.Rocksock(host=self.upstream_ip, port=self.upstream_port)
 		sock.connect()
 		nonce = sock.recv(NONCE_LEN*2 + 1).rstrip(b'\n')
-		sock.sendall(_hash(cmd + self.secret + nonce) + b'\n')
+		# Rocksock has send(), not sendall(); its send() already
+		# calls the underlying socket sendall().
+		sock.send(_hash(cmd + self.secret + nonce) + b'\n')
 		return sock
+
+	def _reconnect(self):
+		# Lost-control fix: old doit() let recvline() raise on
+		# EOF and the whole client exited, killing all tunnels.
+		# Tear down control+spare and retry handshake with backoff.
+		for attr in ('controlsock', 'next_csock'):
+			old = getattr(self, attr)
+			if old is not None:
+				try:
+					old.disconnect()
+				except Exception:
+					pass
+			setattr(self, attr, None)
+		while True:
+			try:
+				self.controlsock = self._setup_sock(b'adm')
+				self.next_csock = self._setup_sock(b'skt')
+				return
+			except Exception as e:
+				print(_timestamp() + b'reconnect failed: %s (retry in 2s)' % str(e).encode())
+				time.sleep(2)
 
 	def setup(self):
 		self.controlsock = self._setup_sock(b'adm')
@@ -112,6 +135,12 @@ class NATClient():
 					i += 1
 
 			l = self.controlsock.recvline()
+			if not l or not l.endswith(b'\n'):
+				# EOF or truncated line: control socket is gone,
+				# do not crash; re-establish control+spare.
+				print(_timestamp() + b'lost control socket, reconnecting')
+				self._reconnect()
+				continue
 			print(_timestamp() + l.rstrip(b'\n'))
 			if l.startswith(b'CONN:'):
 				addr=l.rstrip(b'\n').split(b':')[1]
@@ -120,7 +149,14 @@ class NATClient():
 				thread = Tunnel(local_conn.sock, self.next_csock.sock, addr)
 				thread.start()
 				self.threads.append(thread)
-				self.next_csock = self._setup_sock(b'skt')
+				# The spare socket setup can fail if the server died
+				# right after sending CONN; that is a lost control
+				# socket, not a reason to crash. Reconnect instead.
+				try:
+					self.next_csock = self._setup_sock(b'skt')
+				except Exception:
+					print(_timestamp() + b'lost spare socket, reconnecting')
+					self._reconnect()
 
 
 class NATSrv():

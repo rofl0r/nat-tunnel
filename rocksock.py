@@ -319,11 +319,18 @@ class Rocksock():
 		return data
 
 	def recvline(self):
+		# Old code compared to '' (str) in py3 and relied on
+		# recv() raising on EOF. Return what we have on EOF
+		# (b'' if nothing) so callers can detect a lost control
+		# socket via empty/short line instead of crashing.
 		s = b''
-		c = b'\0'
-		while c != b'\n':
-			c = self.recv(1)
-			if c == '': return s
+		while not s.endswith(b'\n'):
+			try:
+				c = self.recv(1)
+			except RocksockException:
+				return s
+			if not c:
+				return s
 			s += c
 		return s
 
