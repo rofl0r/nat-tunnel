@@ -130,12 +130,19 @@ def RocksockHostinfoFromString(s):
 	return RocksockHostinfo(host, port)
 
 def isnumericipv4(ip):
-	import ipaddress as _ipaddr
-	try:
-		_ipaddr.IPv4Address(ip)
-		return True
-	except ValueError:
+	# Inline strict check (stdlib only, no extra module): exactly 4
+	# fields, ASCII digits only, no sign/spaces/empty, 0-255.
+	parts = ip.split('.')
+	if len(parts) != 4:
 		return False
+	for part in parts:
+		if not part or len(part) > 3:
+			return False
+		if not all('0' <= ch <= '9' for ch in part):
+			return False
+		if int(part) > 255:
+			return False
+	return True
 
 def resolve(hostinfo, want_v4=False):
 	if isnumericipv4(hostinfo.host):
