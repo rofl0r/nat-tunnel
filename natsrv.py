@@ -331,7 +331,10 @@ class NATSrv():
 			if not self.next_upstream_socket:
 				self.wait_conn_up()
 			if self.control_socket and self.next_upstream_socket:
-				a,b,c = select.select([self.sc, self.control_socket, ], [], [])
+				# Bug: select list omitted next_upstream_socket, so the
+				# 'lost spare' branch below could never fire and a dead
+				# spare was paired with the next public client.
+				a,b,c = select.select([self.sc, self.control_socket, self.next_upstream_socket], [], [])
 				if self.control_socket in a:
 					print("lost control socket")
 					self.control_socket.close()
