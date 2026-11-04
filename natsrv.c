@@ -240,8 +240,9 @@ static void *tunnel_thread(void *data) {
 			if(errno == EINTR) continue;
 			break;
 		}
+		if(!((fds[0].revents | fds[1].revents) & (POLLIN|POLLERR|POLLHUP|POLLNVAL))) break;
+		int infd = (fds[0].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) ? t->fds : t->fdc;
 		if(!(fds[0].revents & POLLIN) && !(fds[1].revents & POLLIN)) break;
-		int infd = (fds[0].revents & POLLIN) ? t->fds : t->fdc;
 		int outfd = (infd == t->fds) ? t->fdc : t->fds;
 		char buf[BUFSZ];
 		ssize_t n = recv(infd, buf, sizeof buf, 0);
