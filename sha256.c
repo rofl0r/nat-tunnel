@@ -48,6 +48,12 @@ void sha256_update(sha256_ctx *ctx, const unsigned char *buf, size_t n) {
 }
 void sha256_final(sha256_ctx *ctx, unsigned char out[SHA256_DIGEST_SIZE]) {
 	uint64_t bits = ctx->len * 8;
+	/* Work on a copy so final() is idempotent: the old code
+	   fed padding through sha256_update(), which mutated len
+	   and buf, so a second final() (or reuse after final())
+	   produced a wrong digest. */
+	sha256_ctx tmp = *ctx;
+	ctx = &tmp;
 	unsigned char pad = 0x80;
 	sha256_update(ctx, &pad, 1);
 	pad = 0;
