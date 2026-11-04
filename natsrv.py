@@ -204,14 +204,21 @@ class NATClient():
 class NATSrv():
 	def _isnumericipv4(self, ip):
 		# Old check only tested int(field) < 256, so it accepted
-		# negatives, spaces and unicode digits. ipaddress is strict:
-		# dotted decimal, 0-255 per octet, no leading junk.
-		import ipaddress as _ipaddr
-		try:
-			_ipaddr.IPv4Address(ip)
-			return True
-		except ValueError:
+		# negatives, spaces and unicode digits. Require 4 fields,
+		# ASCII digits only, no sign, no spaces, no empty field,
+		# value 0-255. Leading zeroes still fall through to
+		# getaddrinfo in _resolve, so nothing else changes.
+		parts = ip.split('.')
+		if len(parts) != 4:
 			return False
+		for part in parts:
+			if not part or len(part) > 3:
+				return False
+			if not all('0' <= ch <= '9' for ch in part):
+				return False
+			if int(part) > 255:
+				return False
+		return True
 
 	def _resolve(self, host, port, want_v4=False, passive=False):
 		# AI_PASSIVE was passed even for outbound client connects
