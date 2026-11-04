@@ -203,12 +203,14 @@ class NATClient():
 
 class NATSrv():
 	def _isnumericipv4(self, ip):
+		# Old check only tested int(field) < 256, so it accepted
+		# negatives, spaces and unicode digits. ipaddress is strict:
+		# dotted decimal, 0-255 per octet, no leading junk.
+		import ipaddress as _ipaddr
 		try:
-			a,b,c,d = ip.split('.')
-			if int(a) < 256 and int(b) < 256 and int(c) < 256 and int(d) < 256:
-				return True
-			return False
-		except:
+			_ipaddr.IPv4Address(ip)
+			return True
+		except ValueError:
 			return False
 
 	def _resolve(self, host, port, want_v4=True):
