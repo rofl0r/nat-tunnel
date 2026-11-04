@@ -179,85 +179,116 @@ static int resolve_host(const char *host, unsigned short port, int passive, stru
 	return getaddrinfo(host, port_buf, &hints, out);
 }
 
-/* Mimic python resolve(): numeric IPv4 fast path, otherwise first
-   AF_UNSPEC SOCK_STREAM result, preferring v4 implicitly via order.
-   Python: isnumericipv4 -> v4, else getaddrinfo (AF_UNSPEC, AI_PASSIVE)
-   and skip non-v4 if want_v4 (default True). So effectively v4 only
-   unless getaddrinfo returns only v6? No: it skips all non-v4, so
-   only v4 is ever returned. Keep that: pick first AF_INET. */
+/* Address handling: explicit numeric literals win. A numeric v4
+   literal gives v4, a numeric v6 literal gives v6. For host names
+   we prefer v4 and fall back to v6 (matches py _resolve default
+   want_v4=False ordering after the fix; connect tries every
+   result in turn). Listen sockets use the resolved family. */
+union sockaddr_union {
+	struct sockaddr_in v4;
+	struct sockaddr_in6 v6;
+};
+
 static int is_numeric_v4(const char *ip) {
 	unsigned int a,b,c,d;
 	char extra;
-	/* reject trailing junk, empty, and negatives */
 	if(sscanf(ip, "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra) != 4) return 0;
 	return a < 256 && b < 256 && c < 256 && d < 256;
 }
 
-static int resolve_v4(const char *host, unsigned short port, int passive, struct sockaddr_in *out, socklen_t *outlen) {
-	if(is_numeric_v4(host)) {
-		memset(out, 0, sizeof *out);
-		out->sin_family = AF_INET;
-		out->sin_port = htons(port);
-		if(inet_pton(AF_INET, host, &out->sin_addr) != 1) return -1;
-		if(outlen) *outlen = sizeof *out;
-		return 0;
+static int is_numeric_v6(const char *ip) {
+	struct in6_addr addr;
+	return inet_pton(AF_INET6, ip, &addr) == 1;
+}
+
+static int resolve_any(const char *host, unsigned short port, int passive, struct addrinfo **out) {
+	/* Numeric literal fast path: build a one-result list via
+	   getaddrinfo on the literal itself (no DNS), so callers
+	   get a uniform addrinfo to iterate. */
+	if(is_numeric_v4(host) || is_numeric_v6(host)) {
+		struct addrinfo hints;
+		memset(&hints, 0, sizeof hints);
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_STREAM;
+		if(passive) hints.ai_flags = AI_PASSIVE;
+		char port_buf[8];
+		snprintf(port_buf, sizeof port_buf, "%u", (unsigned)port);
+		return getaddrinfo(host, port_buf, &hints, out);
 	}
-	struct addrinfo *ai = 0;
-	if(resolve_host(host, port, passive, &ai)) return -1;
+	return resolve_host(host, port, passive, out);
+}
+
+/* Pick the best addrinfo: first v4 wins, otherwise first v6.
+   This keeps v4 preferred for host names while allowing v6. */
+static struct addrinfo *pick_best(struct addrinfo *ai) {
 	struct addrinfo *p;
-	int rc = -1;
-	for(p = ai; p; p = p->ai_next) {
-		if(p->ai_family != AF_INET) continue;
-		if(p->ai_addrlen != sizeof *out) continue;
-		memcpy(out, p->ai_addr, sizeof *out);
-		if(outlen) *outlen = sizeof *out;
-		rc = 0;
-		break;
-	}
-	freeaddrinfo(ai);
-	return rc;
+	for(p = ai; p; p = p->ai_next)
+		if(p->ai_family == AF_INET) return p;
+	for(p = ai; p; p = p->ai_next)
+		if(p->ai_family == AF_INET6) return p;
+	return 0;
 }
 
 static int connect_to(const char *host, unsigned short port) {
-	struct sockaddr_in addr;
-	socklen_t len;
-	if(resolve_v4(host, port, 0, &addr, &len) < 0) return -1;
-	int fd = socket(AF_INET, SOCK_STREAM, 0);
-	if(fd < 0) return -1;
-	if(connect(fd, (struct sockaddr*)&addr, len) < 0) {
-		close(fd);
-		return -1;
+	struct addrinfo *ai = 0;
+	if(resolve_any(host, port, 0, &ai) < 0) return -1;
+	/* Try every result in turn (v4 first via pick order is not
+	   enough alone: a dead v4 must not block a live v6). */
+	struct addrinfo *order[2];
+	order[0] = pick_best(ai);
+	order[1] = 0;
+	if(order[0]) {
+		struct addrinfo *p;
+		for(p = ai; p; p = p->ai_next)
+			if(p != order[0] && !order[1]) order[1] = p;
 	}
+	int fd = -1;
+	int i;
+	for(i=0;i<2;i++) {
+		struct addrinfo *sel = order[i];
+		if(!sel) continue;
+		fd = socket(sel->ai_family, sel->ai_socktype, sel->ai_protocol);
+		if(fd < 0) continue;
+		if(connect(fd, sel->ai_addr, sel->ai_addrlen) == 0) break;
+		close(fd);
+		fd = -1;
+	}
+	freeaddrinfo(ai);
 	return fd;
 }
 
 static int listen_on(const char *host, unsigned short port) {
-	struct sockaddr_in addr;
-	socklen_t len;
-	if(resolve_v4(host, port, 1, &addr, &len) < 0) return -1;
-	int fd = socket(AF_INET, SOCK_STREAM, 0);
-	if(fd < 0) return -1;
+	struct addrinfo *ai = 0;
+	if(resolve_any(host, port, 1, &ai) < 0) return -1;
+	struct addrinfo *sel = pick_best(ai);
+	if(!sel) { freeaddrinfo(ai); return -1; }
+	int fd = socket(sel->ai_family, sel->ai_socktype, sel->ai_protocol);
+	if(fd < 0) { freeaddrinfo(ai); return -1; }
 	int yes = 1;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
-	if(bind(fd, (struct sockaddr*)&addr, len) < 0) {
-		close(fd);
-		return -1;
+	if(sel->ai_family == AF_INET6) {
+		int v6only = 1;
+		setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof v6only);
 	}
-	if(listen(fd, 1) < 0) {
-		close(fd);
-		return -1;
-	}
+	int rc = bind(fd, sel->ai_addr, sel->ai_addrlen);
+	if(rc == 0) rc = listen(fd, 1);
+	freeaddrinfo(ai);
+	if(rc < 0) { close(fd); return -1; }
 	return fd;
 }
 
-static void format_addr(const struct sockaddr_in *a, char *out, size_t cap) {
-	char ip[INET_ADDRSTRLEN];
-	const char *s = inet_ntop(AF_INET, &a->sin_addr, ip, sizeof ip);
-	if(!s) s = "?";
-	/* IPv4 wire format is unchanged (ip:port). IPv6 peers send
-	   [addr]:port; this C server is still v4-only for listen,
-	   so no brackets are emitted here yet. */
-	snprintf(out, cap, "%s:%u", s, (unsigned)ntohs(a->sin_port));
+static void format_addr(const union sockaddr_union *a, char *out, size_t cap) {
+	char ip[INET6_ADDRSTRLEN];
+	if(a->v4.sin_family == AF_INET6) {
+		const char *s = inet_ntop(AF_INET6, &a->v6.sin6_addr, ip, sizeof ip);
+		if(!s) s = "?";
+		/* Wire format for v6 is [addr]:port, matching py fix. */
+		snprintf(out, cap, "[%s]:%u", s, (unsigned)ntohs(a->v6.sin6_port));
+	} else {
+		const char *s = inet_ntop(AF_INET, &a->v4.sin_addr, ip, sizeof ip);
+		if(!s) s = "?";
+		snprintf(out, cap, "%s:%u", s, (unsigned)ntohs(a->v4.sin_port));
+	}
 }
 
 struct tunnel {
@@ -481,7 +512,7 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 /* ---- NAT server ---- */
 
 static int server_wait_conn_up(int su, int *control, int *next_up) {
-	struct sockaddr_in addr;
+	union sockaddr_union addr;
 	socklen_t alen = sizeof addr;
 	int conn = accept(su, (struct sockaddr*)&addr, &alen);
 	if(conn < 0) return -1;
@@ -585,7 +616,7 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 				continue;
 			}
 			if(fds[0].revents & POLLIN) {
-				struct sockaddr_in addr;
+				union sockaddr_union addr;
 				socklen_t alen = sizeof addr;
 				int conn = accept(sc, (struct sockaddr*)&addr, &alen);
 				if(conn < 0) continue;
@@ -646,14 +677,35 @@ static void usage(const char *prog) {
 }
 
 static int parse_ip_port(const char *s, char *ip, size_t ip_cap, unsigned short *port) {
-	const char *colon = strrchr(s, ':');
-	if(!colon) return -1;
-	size_t n = (size_t)(colon - s);
-	if(n == 0 || n >= ip_cap) return -1;
-	memcpy(ip, s, n);
-	ip[n] = 0;
+	/* CLI form is host:port. IPv6 literals must use brackets:
+	   [::1]:8080. A bare v6 address is ambiguous with the port
+	   separator, so it is rejected here (getaddrinfo would
+	   also reject it). */
+	const char *colon;
+	size_t n;
+	if(s[0] == '[') {
+		const char *rb = strchr(s, ']');
+		if(!rb || rb[1] != ':') return -1;
+		colon = rb + 1;
+		n = (size_t)(rb - s - 1);
+		if(n == 0 || n >= ip_cap) return -1;
+		memcpy(ip, s + 1, n);
+		ip[n] = 0;
+		colon++;
+	} else {
+		colon = strrchr(s, ':');
+		if(!colon) return -1;
+		/* Reject bare v6: more than one colon means the host
+		   part was not bracketed. */
+		if(strchr(s, ':') != colon) return -1;
+		n = (size_t)(colon - s);
+		if(n == 0 || n >= ip_cap) return -1;
+		memcpy(ip, s, n);
+		ip[n] = 0;
+		colon++;
+	}
 	char *end = 0;
-	long p = strtol(colon+1, &end, 10);
+	long p = strtol(colon, &end, 10);
 	if(!end || *end || p < 0 || p > 65535) return -1;
 	*port = (unsigned short)p;
 	return 0;
