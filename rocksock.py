@@ -130,20 +130,19 @@ def RocksockHostinfoFromString(s):
 	return RocksockHostinfo(host, port)
 
 def isnumericipv4(ip):
+	import ipaddress as _ipaddr
 	try:
-		a,b,c,d = ip.split('.')
-		if int(a) < 256 and int(b) < 256 and int(c) < 256 and int(d) < 256:
-			return True
-		return False
-	except:
+		_ipaddr.IPv4Address(ip)
+		return True
+	except ValueError:
 		return False
 
-def resolve(hostinfo, want_v4=True):
+def resolve(hostinfo, want_v4=False):
 	if isnumericipv4(hostinfo.host):
 		return socket.AF_INET, (hostinfo.host, hostinfo.port)
 	try:
-		for res in socket.getaddrinfo(hostinfo.host, hostinfo.port, \
-				socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE):
+		# connect() path: never AI_PASSIVE; accept v6 by default
+		for res in socket.getaddrinfo(hostinfo.host, hostinfo.port, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, 0):
 			af, socktype, proto, canonname, sa = res
 			if want_v4 and af != socket.AF_INET: continue
 			if af != socket.AF_INET and af != socket.AF_INET6: continue
@@ -233,7 +232,7 @@ class Rocksock():
 		self.sock = socket.socket(af, socket.SOCK_STREAM)
 		self.sock.settimeout(None if self.timeout == 0 else self.timeout)
 		try:
-			self.sock.connect((sa[0], sa[1]))
+			self.sock.connect(sa)  # 2-tuple v4 / 4-tuple v6
 		except socket.timeout:
 			raise(RocksockException(RS_E_HIT_TIMEOUT, failedproxy=self._failed_proxy(0)))
 		except socket.error as e:

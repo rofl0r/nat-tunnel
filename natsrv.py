@@ -213,16 +213,19 @@ class NATSrv():
 		except ValueError:
 			return False
 
-	def _resolve(self, host, port, want_v4=True):
+	def _resolve(self, host, port, want_v4=False, passive=False):
+		# AI_PASSIVE was passed even for outbound client connects
+		# and want_v4 defaulted True, so IPv6-only hosts could
+		# never resolve. passive is now only for listen sockets,
+		# and both address families are accepted by default.
 		if self._isnumericipv4(host):
 			return socket.AF_INET, (host, port)
-		for res in socket.getaddrinfo(host, port, \
-				socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE):
+		flags = socket.AI_PASSIVE if passive else 0
+		for res in socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, flags):
 			af, socktype, proto, canonname, sa = res
 			if want_v4 and af != socket.AF_INET: continue
 			if af != socket.AF_INET and af != socket.AF_INET6: continue
 			else: return af, sa
-
 		return None, None
 
 	def __init__(self, secret, upstream_listen_ip, upstream_port, client_listen_ip, client_port):
@@ -239,10 +242,15 @@ class NATSrv():
 		self.hashlen = len(_hash(b''))
 
 	def _setup_listen_socket(self, listenip, port):
-		af, sa = self._resolve(listenip, port)
+		af, sa = self._resolve(listenip, port, passive=True)
+		if af is None:
+			raise ValueError('cannot resolve %r' % listenip)
 		s = socket.socket(af, socket.SOCK_STREAM)
 		s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-		s.bind((sa[0], sa[1]))
+		try:
+			s.bind(sa)  # sa is 2-tuple for v4, 4-tuple for v6
+		except TypeError:
+			s.bind((sa[0], sa[1]))
 		s.listen(1)
 		return s
 
