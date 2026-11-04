@@ -286,6 +286,16 @@ class NATSrv():
 			conn.settimeout(None)
 			if self.control_socket:
 				self.control_socket.close()
+			# Orphan spare bug: a new admin replaced the control
+			# socket but left the old spare tunnel socket in
+			# place, so the next public client was paired with a
+			# tunnel from the dead admin session. Close it.
+			if self.next_upstream_socket:
+				try:
+					self.next_upstream_socket.close()
+				except OSError:
+					pass
+				self.next_upstream_socket = None
 			self.control_socket = conn
 			print("OK (admin)")
 		elif cmd == _hash(b'skt' + self.secret + nonce):
