@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <sys/time.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <pthread.h>
@@ -453,6 +454,14 @@ static int server_wait_conn_up(int su, int *control, int *next_up) {
 	socklen_t alen = sizeof addr;
 	int conn = accept(su, (struct sockaddr*)&addr, &alen);
 	if(conn < 0) return -1;
+	/* Handshake timeout (matches py fix): a client that
+	   connects and sends nothing must not freeze the server. */
+	{
+		struct timeval tv;
+		tv.tv_sec = 10;
+		tv.tv_usec = 0;
+		setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+	}
 	char nonce[NONCE_HEX_LEN+1];
 	get_nonce(nonce);
 	char addrstr[64];
@@ -469,6 +478,12 @@ static int server_wait_conn_up(int su, int *control, int *next_up) {
 	/* python: conn.recv(1+hashlen).rstrip(b'\n') - plain recv, may be short.
 	   We read exactly hashlen+1; a short read is a rejected client. */
 	if(recv_exact(conn, cmdbuf, HASH_HEX_LEN+1) < 0) { printf("rejected!\n"); close(conn); return 0; }
+	{
+		struct timeval tv;
+		tv.tv_sec = 0;
+		tv.tv_usec = 0;
+		setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+	}
 	cmdbuf[HASH_HEX_LEN+1] = 0;
 	size_t cl = HASH_HEX_LEN+1;
 	while(cl > 0 && cmdbuf[cl-1] == '\n') { cmdbuf[--cl] = 0; }
