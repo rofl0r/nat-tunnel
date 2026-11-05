@@ -333,18 +333,10 @@ static int load_server_key(const char *path) {
 }
 
 static void x25519_base(unsigned char *out, const unsigned char *sk) {
-#ifdef USE_SODIUM
 	NCRYPT_SCALARMULT_BASE(out, sk);
-#else
-	NCRYPT_SCALARMULT_BASE(out, sk);
-#endif
 }
 static void x25519_mul(unsigned char *out, const unsigned char *sk, const unsigned char *pk) {
-#ifdef USE_SODIUM
 	NCRYPT_SCALARMULT(out, sk, pk);
-#else
-	NCRYPT_SCALARMULT(out, sk, pk);
-#endif
 }
 static unsigned char g_sign_buf[128];
 static int ed_sign(unsigned char *sig, const unsigned char *msg, size_t len) {
@@ -1095,11 +1087,7 @@ static int hex_parse(const char *hex, unsigned char *out, size_t outlen) {
 
 static int do_genkey(const char *outpath) {
 	unsigned char pk[32], sk[64];
-#ifdef USE_SODIUM
 	if(NCRYPT_SIGN_KEYPAIR(pk, sk) != 0) { fprintf(stderr, "crypto_sign_keypair failed\n"); return 1; }
-#else
-	NCRYPT_SIGN_KEYPAIR(pk, sk);
-#endif
 	int fd = open(outpath, 1|64|512, 0600);
 	if(fd < 0) { perror(outpath); return 1; }
 	/* file format: hex pk + newline + hex sk + newline, for pinning */
