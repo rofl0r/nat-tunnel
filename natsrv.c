@@ -170,26 +170,61 @@ static int ct_equal(const char *a, const char *b, size_t n) {
 	return diff == 0;
 }
 
-/* sk2 stream cipher: SHA256 in counter mode, per tunnel, per
-   direction. Mirrors the Python _CtrStream / _enc_keys exactly:
-   key = sha256(label + secret + nonce), label "enc-up" or
-   "enc-dn"; block i = sha256(key + be64(i)); data XOR keystream.
-   State (counter + leftover) is continuous across chunks. */
+/* sk2 stream cipher: XSalsa20, per tunnel, per direction.
+   Default backend is TweetNaCl (tweetnacl.c, public domain),
+   streaming via crypto_core_* with a persistent 64-bit block
+   counter. With USE_SODIUM=1 it links libsodium instead and
+   uses crypto_stream_xsalsa20_xor_ic with a persistent block
+   counter. Key: sha256(label + secret + nonce), label
+   "enc-up" or "enc-dn" (32 bytes). Nonce24 is derived as
+   sha256("enc-nonce" + secret + nonce) truncated to 24
+   bytes. Directions never share a key stream. */
+#include "tweetnacl.h"
+#ifndef USE_SODIUM
+/* TweetNaCl keypair functions reference randombytes(), but the
+   stream code we use does not. Provide a fail-closed stub so
+   linking tweetnacl.c succeeds without a full RNG backend. */
+#include <stdlib.h>
+void randombytes(unsigned char *x, unsigned long long n) {
+	(void)x; (void)n;
+	fprintf(stderr, "randombytes: not available\n");
+	exit(1);
+}
+#endif
+#ifdef USE_SODIUM
+#include <sodium.h>
+#endif
 struct ctr_stream {
-	unsigned char key[SHA256_DIGEST_SIZE];
-	unsigned long long counter;
-	unsigned char leftover[SHA256_DIGEST_SIZE];
+	unsigned char key[32];
+	unsigned char nonce[24];
+	unsigned char subkey[32];
+	unsigned long long block_counter;
+	unsigned char leftover[64];
 	size_t leftover_len;
 };
 
-static void ctr_init(struct ctr_stream *st, const char *label, const char *nonce) {
+static void derive_key(const char *label, const char *nonce, unsigned char out[32]) {
 	sha256_ctx ctx;
 	sha256_init(&ctx);
 	sha256_update(&ctx, (const unsigned char*)label, strlen(label));
 	sha256_update(&ctx, (const unsigned char*)g_secret, g_secret_len);
 	sha256_update(&ctx, (const unsigned char*)nonce, strlen(nonce));
-	sha256_final(&ctx, st->key);
-	st->counter = 0;
+	sha256_final(&ctx, out);
+}
+
+static void ctr_init(struct ctr_stream *st, const char *label, const char *nonce) {
+	unsigned char n24full[32];
+	derive_key(label, nonce, st->key);
+	derive_key("enc-nonce", nonce, n24full);
+	memcpy(st->nonce, n24full, 24);
+#ifndef USE_SODIUM
+	{
+		unsigned char sigma_[16];
+		memcpy(sigma_, "expand 32-byte k", 16);
+		crypto_core_hsalsa20(st->subkey, st->nonce, st->key, sigma_);
+	}
+#endif
+	st->block_counter = 0;
 	st->leftover_len = 0;
 }
 
@@ -197,25 +232,34 @@ static void ctr_crypt(struct ctr_stream *st, unsigned char *data, size_t n) {
 	size_t pos = 0;
 	while(pos < n) {
 		if(st->leftover_len == 0) {
-			unsigned char ctrbe[8];
-			unsigned long long c = st->counter++;
-			int i;
-			for(i=0;i<8;i++) ctrbe[i] = (unsigned char)(c >> (56 - 8*i));
-			sha256_ctx ctx;
-			sha256_init(&ctx);
-			sha256_update(&ctx, st->key, SHA256_DIGEST_SIZE);
-			sha256_update(&ctx, ctrbe, 8);
-			sha256_final(&ctx, st->leftover);
-			st->leftover_len = SHA256_DIGEST_SIZE;
+#ifdef USE_SODIUM
+			{
+				unsigned char zeros[64];
+				memset(zeros, 0, 64);
+				crypto_stream_xsalsa20_xor_ic(st->leftover, zeros, 64, st->nonce, st->block_counter, st->key);
+			}
+#else
+			{
+				unsigned char sigma_[16];
+				unsigned char z[16];
+				memcpy(sigma_, "expand 32-byte k", 16);
+				memcpy(z, st->nonce + 16, 8);
+				memset(z + 8, 0, 8);
+				{
+					unsigned long long c = st->block_counter;
+					int i;
+					for(i=0;i<8;i++) z[8+i] = (unsigned char)(c >> (8*i));
+				}
+				crypto_core_salsa20(st->leftover, z, st->subkey, sigma_);
+			}
+#endif
+			st->leftover_len = 64;
+			st->block_counter++;
 		}
-		if(st->leftover_len < n - pos) {
-			size_t i;
-			for(i=0;i<st->leftover_len;i++) data[pos+i] ^= st->leftover[i];
-			pos += st->leftover_len;
-			st->leftover_len = 0;
-		} else {
+		{
 			size_t take = n - pos;
 			size_t i;
+			if(take > st->leftover_len) take = st->leftover_len;
 			for(i=0;i<take;i++) data[pos+i] ^= st->leftover[i];
 			memmove(st->leftover, st->leftover+take, st->leftover_len-take);
 			st->leftover_len -= take;

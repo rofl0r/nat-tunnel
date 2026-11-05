@@ -40,13 +40,25 @@ Server (IPv6, note the brackets):
 Client (IPv6 upstream, IPv4 local):
 
     natsrv.py --mode client --secret s3cretP4ss --local localhost:80 --admin [2001:db8::1]:8000
+Python version status
+-------------------
+The Python version (natsrv.py plus rocksock.py) is final and
+unmaintained. It is kept for reference only. As of the sk2
+XSalsa20 change, Python and C are incompatible on the wire
+for encrypted tunnels: C uses XSalsa20 via TweetNaCl or
+libsodium, Python still uses SHA256-CTR. Matching pairs are
+required. Use the C version for new deployments.
 
 C version
 ---------
-A C99 port of natsrv.py is included (natsrv.c, sha256.c, sha256.h,
-Makefile). It speaks the same wire protocol and interoperates with
-the Python version in both directions. The sha256 implementation
-is written from scratch in sha256.c; no crypto library is needed.
+A C99 implementation is included (natsrv.c, sha256.c, sha256.h,
+tweetnacl.c, tweetnacl.h, Makefile). Tunnel encryption uses
+XSalsa20. By default it is provided by the bundled TweetNaCl
+code; with USE_SODIUM=1 it links libsodium instead. The sha256
+implementation is written from scratch in sha256.c; no crypto
+library is needed for the default build. Note the Python
+version is final and incompatible for encrypted tunnels;
+see the Python version status section above.
 
 Build it with plain GNU Make (3.82 or newer):
 
@@ -57,11 +69,17 @@ This produces ./natsrv. Run it exactly like the Python program:
     ./natsrv --mode server --secret s3cretP4ss --public 0.0.0.0:7000 --admin 0.0.0.0:8000
     ./natsrv --mode client --secret s3cretP4ss --local localhost:80 --admin example.com:8000
 
-Options on the Make command line pass through CPPFLAGS and CFLAGS,
-for example:
+The Makefile starts with -include config.mak before the first
+target, so a local config.mak can permanently set CFLAGS,
+CPPFLAGS, LDFLAGS, and friends. Note the Makefile appends its
+own defaults afterwards with CFLAGS += -Wall -std=c99, so a
+plain CFLAGS = assignment in config.mak is kept and the
+defaults are appended to it. Options on the Make command line
+also pass through, for example:
 
     make CPPFLAGS=-DHAVE_GETRANDOM
     make CFLAGS="-Wall -Wextra -std=c99 -pedantic"
+    make USE_SODIUM=1
     make clean
 
 HAVE_GETRANDOM: by default the C port reads nonce randomness from

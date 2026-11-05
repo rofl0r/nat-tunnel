@@ -1,9 +1,18 @@
+-include config.mak
+
 PROG = natsrv
-SRCS = natsrv.c sha256.c
-OBJS = $(SRCS:.c=.o)
 
 LIBS = -lpthread
 CFLAGS += -Wall -std=c99
+
+ifdef USE_SODIUM
+CPPFLAGS += -DUSE_SODIUM
+LIBS += -lsodium
+SRCS = natsrv.c sha256.c
+else
+SRCS = natsrv.c sha256.c tweetnacl.c
+endif
+OBJS = $(SRCS:.c=.o)
 
 all: $(PROG)
 
