@@ -987,7 +987,7 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 
 static void usage(const char *prog) {
 	printf(
-		"NAT Tunnel v0.01\n"
+		"NAT Tunnel\n"
 		"----------------\n"
 		"If you have access to a server with public IP and unfiltered ports\n"
 		"you can run NAT Tunnel (NT)  server on the server, and NT client\n"
