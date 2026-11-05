@@ -1214,9 +1214,9 @@ int main(int argc, char **argv) {
 	}
 	const char *secret = 0;
 	const char *mode = 0;
-	const char *public_addr = "0.0.0.0:8080";
-	const char *local_addr = "localhost:80";
-	const char *admin_addr = "0.0.0.0:8081";
+	const char *public_addr = 0;
+	const char *local_addr = 0;
+	const char *admin_addr = 0;
 	const char *timeout_s = 0;
 	const char *secret_file = 0;
 	const char *server_key = 0;
@@ -1253,10 +1253,14 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "--secret and --secret-file are mutually exclusive\n");
 		return 1;
 	}
-	if((!secret && !secret_file) || !mode) {
-		fprintf(stderr, "--secret or --secret-file, and --mode, are required\n");
-		return 1;
-	}
+	if(!mode) { fprintf(stderr, "--mode is required (server or client)\n"); return 1; }
+	if(!secret && !secret_file) { fprintf(stderr, "--secret or --secret-file is required\n"); return 1; }
+	if(!admin_addr) { fprintf(stderr, "--admin is required\n"); return 1; }
+	if(strcmp(mode, "server") == 0 && !public_addr) { fprintf(stderr, "--public is required in server mode\n"); return 1; }
+	if(strcmp(mode, "client") == 0 && !local_addr) { fprintf(stderr, "--local is required in client mode\n"); return 1; }
+	if(!public_addr) public_addr = "0.0.0.0:8080";
+	if(!local_addr) local_addr = "localhost:80";
+	if(!admin_addr) admin_addr = "0.0.0.0:8081";
 	if(timeout_s) {
 		char *end = 0;
 		long v = strtol(timeout_s, &end, 10);
