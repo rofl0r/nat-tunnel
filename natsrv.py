@@ -17,6 +17,38 @@ def _get_nonce():
 def _hash(str):
 	return _b(hashlib.sha256(str).hexdigest(), 'utf-8')
 
+# sk2 encryption: SHA256 in counter mode, per tunnel, per direction.
+# Key derivation: sha256(label + secret + nonce) where nonce is the
+# 16 hex chars from that tunnel's handshake. Labels "enc-up" and
+# "enc-dn" give different keys per direction, so the two streams
+# never share a key stream. Stream block i is
+# sha256(key + struct.pack('>Q', i)), XORed with the data.
+# State is (counter, leftover keystream bytes) and is continuous
+# across recv() chunks, so TCP packet boundaries do not matter.
+import struct as _struct
+class _CtrStream:
+	def __init__(self, key):
+		self.key = key
+		self.counter = 0
+		self.leftover = b''
+	def crypt(self, data):
+		out = bytearray(len(data))
+		pos = 0
+		while pos < len(data):
+			if not self.leftover:
+				self.leftover = hashlib.sha256(self.key + _struct.pack('>Q', self.counter)).digest()
+				self.counter += 1
+			n = min(len(self.leftover), len(data) - pos)
+			for i in range(n):
+				out[pos + i] = data[pos + i] ^ self.leftover[i]
+			self.leftover = self.leftover[n:]
+			pos += n
+		return bytes(out)
+
+def _enc_keys(secret, nonce):
+	return (hashlib.sha256(b'enc-up' + secret + nonce).digest(),
+	        hashlib.sha256(b'enc-dn' + secret + nonce).digest())
+
 # CONN address format: IPv4 is "1.2.3.4:1234", IPv6 is "[::1]:1234".
 # The brackets are required: a bare IPv6 address contains colons,
 # so split(b':') cannot tell address from port. Use a pre-compiled
@@ -55,11 +87,17 @@ def _timestamp():
 	return _b(time.strftime('[%Y-%m-%d %H:%M:%S] ', time.localtime(time.time())), 'utf-8')
 
 class Tunnel():
-	def __init__(self, fds, fdc, caddr):
+	def __init__(self, fds, fdc, caddr, enc=None):
 		self.fds = fds
 		self.fdc = fdc
 		self.done = threading.Event()
 		self.t = None
+		# enc is None (cleartext skt) or (up_stream, dn_stream)
+		# where up is fds->fdc and dn is fdc->fds. Direction is
+		# fixed per Tunnel instance; both ends create the same
+		# pair from the same nonce+secret, so they stay in sync
+		# without any extra handshake bytes.
+		self.enc = enc
 	def _cleanup(self):
 		if self.fdc: self.fdc.close()
 		if self.fds: self.fds.close()
@@ -94,6 +132,8 @@ class Tunnel():
 			try:
 				# send() may write only part of buf; old code dropped
 				# the rest silently. sendall() writes all of it.
+				if self.enc is not None:
+					buf = (self.enc[0] if a[0] == self.fds else self.enc[1]).crypt(buf)
 				other.sendall(buf)
 			except (BrokenPipeError, ConnectionResetError, OSError):
 				break
@@ -126,7 +166,7 @@ class NATClient():
 		# Rocksock has send(), not sendall(); its send() already
 		# calls the underlying socket sendall().
 		sock.send(_hash(cmd + self.secret + nonce) + b'\n')
-		return sock
+		return sock, nonce
 
 	def _reconnect(self):
 		# Lost-control fix: old doit() let recvline() raise on
@@ -142,16 +182,16 @@ class NATClient():
 			setattr(self, attr, None)
 		while True:
 			try:
-				self.controlsock = self._setup_sock(b'adm')
-				self.next_csock = self._setup_sock(b'skt')
+				self.controlsock, _ = self._setup_sock(b'adm')
+				self.next_csock, self.next_nonce = self._setup_sock(b'sk2')
 				return
 			except Exception as e:
 				print(_timestamp() + b'reconnect failed: %s (retry in 2s)' % str(e).encode())
 				time.sleep(2)
 
 	def setup(self):
-		self.controlsock = self._setup_sock(b'adm')
-		self.next_csock =  self._setup_sock(b'skt')
+		self.controlsock, _ = self._setup_sock(b'adm')
+		self.next_csock, self.next_nonce = self._setup_sock(b'sk2')
 
 	def doit(self):
 		while True:
@@ -196,19 +236,20 @@ class NATClient():
 							pass
 						self.next_csock = None
 					try:
-						self.next_csock = self._setup_sock(b'skt')
+						self.next_csock, self.next_nonce = self._setup_sock(b'sk2')
 					except Exception:
 						print(_timestamp() + b'lost spare socket, reconnecting')
 						self._reconnect()
 					continue
-				thread = Tunnel(local_conn.sock, self.next_csock.sock, addr)
+				up, dn = _enc_keys(self.secret, self.next_nonce)
+				thread = Tunnel(local_conn.sock, self.next_csock.sock, addr, enc=(_CtrStream(up), _CtrStream(dn)))
 				thread.start()
 				self.threads.append(thread)
 				# The spare socket setup can fail if the server died
 				# right after sending CONN; that is a lost control
 				# socket, not a reason to crash. Reconnect instead.
 				try:
-					self.next_csock = self._setup_sock(b'skt')
+					self.next_csock, self.next_nonce = self._setup_sock(b'sk2')
 				except Exception:
 					print(_timestamp() + b'lost spare socket, reconnecting')
 					self._reconnect()
@@ -312,19 +353,25 @@ class NATSrv():
 			# tunnel from the dead admin session. Close it.
 			if self.next_upstream_socket:
 				try:
-					self.next_upstream_socket.close()
+					self.next_upstream_socket[0].close()
 				except OSError:
 					pass
 				self.next_upstream_socket = None
 			self.control_socket = conn
 			print("OK (admin)")
-		elif hmac.compare_digest(cmd, _hash(b'skt' + self.secret + nonce)):
+		elif hmac.compare_digest(cmd, _hash(b'skt' + self.secret + nonce)) or hmac.compare_digest(cmd, _hash(b'sk2' + self.secret + nonce)):
 			conn.settimeout(None)
-			print("OK (tunnel)")
+			enc_req = hmac.compare_digest(cmd, _hash(b'sk2' + self.secret + nonce))
+			print("OK (tunnel%s)" % (" enc" if enc_req else ""))
 			if not self.control_socket:
 				conn.close()
 			else:
-				self.next_upstream_socket = conn
+				if self.next_upstream_socket:
+					try:
+						self.next_upstream_socket[0].close()
+					except Exception:
+						pass
+				self.next_upstream_socket = (conn, nonce, enc_req)
 		else:
 			print("rejected!")
 			conn.close()
@@ -332,7 +379,23 @@ class NATSrv():
 	def wait_conn_client(self):
 		conn, addr = self.sc.accept()
 		self.control_socket.sendall(b"CONN:%s\n"%_format_addr(addr))
-		thread = Tunnel(self.next_upstream_socket, conn, addr)
+		spare, spare_nonce, enc_req = self.next_upstream_socket
+		enc = None
+		if enc_req:
+			pass
+		# Direction mapping: "up" is client->server (replies,
+		# local->spare on client, spare->public on server) and
+		# "dn" is server->client (requests, public->spare on
+		# server, spare->local on client). Client Tunnel(local,
+		# spare) uses enc[0]=up for local->spare and enc[1]=dn
+		# for spare->local. Server Tunnel(spare, public) has
+		# fds=spare, so enc[0] there is spare->public (replies,
+		# "up") and enc[1] is public->spare (requests, "dn").
+		# Same tuple order on both ends: (up, dn).
+		if enc_req:
+			up, dn = _enc_keys(self.secret, spare_nonce)
+			enc = (_CtrStream(up), _CtrStream(dn))
+		thread = Tunnel(spare, conn, addr, enc=enc)
 		thread.start()
 		self.threads.append(thread)
 		self.next_upstream_socket = None
@@ -354,15 +417,15 @@ class NATSrv():
 				# Bug: select list omitted next_upstream_socket, so the
 				# 'lost spare' branch below could never fire and a dead
 				# spare was paired with the next public client.
-				a,b,c = select.select([self.sc, self.control_socket, self.next_upstream_socket], [], [])
+				a,b,c = select.select([self.sc, self.control_socket, self.next_upstream_socket[0]], [], [])
 				if self.control_socket in a:
 					print("lost control socket")
 					self.control_socket.close()
 					self.control_socket = None
 					continue
-				if self.next_upstream_socket in a:
+				if self.next_upstream_socket[0] in a:
 					print("lost spare upstream socket")
-					self.next_upstream_socket.close()
+					self.next_upstream_socket[0].close()
 					self.next_upstream_socket = None
 					continue
 				if self.sc in a:
