@@ -41,6 +41,67 @@ Client (IPv6 upstream, IPv4 local):
 
     natsrv.py --mode client --secret s3cretP4ss --local localhost:80 --admin [2001:db8::1]:8000
 
+C version
+---------
+A C99 port of natsrv.py is included (natsrv.c, sha256.c, sha256.h,
+Makefile). It speaks the same wire protocol and interoperates with
+the Python version in both directions. The sha256 implementation
+is written from scratch in sha256.c; no crypto library is needed.
+
+Build it with plain GNU Make (3.82 or newer):
+
+    make
+
+This produces ./natsrv. Run it exactly like the Python program:
+
+    ./natsrv --mode server --secret s3cretP4ss --public 0.0.0.0:7000 --admin 0.0.0.0:8000
+    ./natsrv --mode client --secret s3cretP4ss --local localhost:80 --admin example.com:8000
+
+Options on the Make command line pass through CPPFLAGS and CFLAGS,
+for example:
+
+    make CPPFLAGS=-DHAVE_GETRANDOM
+    make CFLAGS="-Wall -Wextra -std=c99 -pedantic"
+    make clean
+
+HAVE_GETRANDOM: by default the C port reads nonce randomness from
+/dev/urandom. Define HAVE_GETRANDOM at build time to use the
+getrandom() syscall instead (Linux 3.17+ / glibc 2.25+):
+
+    make CPPFLAGS=-DHAVE_GETRANDOM
+
+Both paths fail closed if randomness cannot be obtained; there is
+no weaker fallback. Linkage is just -lpthread; the code itself is
+C99 and portable with no GNU99 extensions. Tabs are used for
+indentation, following the microsocks code style.
+
+Security note: see "Wire protocol and encryption" below. The
+control handshake is authenticated with the shared secret, but
+no traffic is encrypted.
+
+Wire protocol and encryption
+----------------------------
+Nothing on the wire is encrypted, in either version. The shared
+secret only authenticates the admin handshake. It does not
+encrypt, sign, or integrity-protect any data after the handshake.
+
+Per admin or tunnel connection the server sends a fresh nonce:
+8 random bytes from the OS (os.urandom in Python, /dev/urandom
+or getrandom() in C), shown as 16 hex characters plus a newline.
+The client replies with hex sha256(cmd + secret + nonce) plus a
+newline, where cmd is "adm" for the control socket or "skt" for
+a spare tunnel socket. The server accepts only if that hash
+matches; otherwise it prints "rejected!" and closes the socket.
+The nonce is never reused for a different connection, and the
+secret itself never goes on the wire. But everyone who can see
+the handshake can see the nonce and the hash, can brute force a
+weak secret offline, and can read every byte after it: the
+CONN: notifications, the public client address, and all tunnel
+payload bytes are sent in cleartext. Anyone on the path can also
+inject or modify tunnel traffic. Use a strong secret and, if
+you need confidentiality or integrity, run the tunnel over TLS
+or another encrypted transport.
+
 IPv6 and addresses
 -------------------
 Both IPv4 and IPv6 work everywhere. Address syntax is host:port.
