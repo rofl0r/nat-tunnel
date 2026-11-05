@@ -116,9 +116,38 @@ scalar -O2 is about 257 MB/s, SHA-NI -O2 is about
 generation the gain is smaller because each 32 byte block
 pays context setup cost: about 98 MB/s scalar versus
 about 223 MB/s with SHA-NI.
+Wire protocol nt02
+------------------
+Binary length prefixed frames: type byte plus big endian
+uint16 payload length plus payload. Types: 1 server hello,
+2 client hello, 3 control, 4 tunnel, 5 error, 6 close.
+Tunnel frames carry up to 16384 bytes. No newline scanning.
 
-Wire protocol and encryption
-----------------------------
+Handshake is 2 round trips. Server sends ephemeral X25519
+public key, capability byte, 16 byte nonce, and an Ed25519
+signature from its long term key. The client verifies against
+its pinned server public key, then sends its own ephemeral
+key, a request byte (0 adm, 1 skt cleartext tunnel, 2 sk2
+encrypted tunnel), and a MAC over the transcript keyed by
+the X25519 shared secret plus the shared secret from
+--secret or --secret-file. That MAC is client authorization;
+the shared secret alone cannot authorize without the
+ephemeral private key, and the ephemeral exchange gives
+forward secrecy. Stream keys derive from the shared secret
+plus transcript hash. CONN peer addresses are always
+encrypted on the control channel, even when the server
+allows cleartext tunnels. Server policy via --allow-cleartext
+(default) or --no-cleartext controls whether skt is accepted.
+Capability byte bit 0 mirrors that setting on the wire.
+
+Keys: ./natsrv --genkey --out server.key generates an
+Ed25519 keypair, private key file 0600, public key hex
+printed for client pinning with --server-pubkey. Server
+requires --server-key, client requires --server-pubkey.
+Prefer --secret-file PATH over --secret on shared boxes.
+
+Wire protocol and encryption (legacy, pre-nt02)
+------------------------------------------------
 The shared secret authenticates the admin handshake. It does not
 sign or integrity-protect any data. Tunnel payload bytes can be
 encrypted with sk2 (below); control traffic never is.

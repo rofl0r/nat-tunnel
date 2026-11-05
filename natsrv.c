@@ -232,6 +232,19 @@ static void derive_key(const char *label, const char *nonce, unsigned char out[3
 	sha256_final(&ctx, out);
 }
 
+static void ctr_init_ex(struct ctr_stream *st, const unsigned char *key, const unsigned char *nonce24) {
+	memcpy(st->key, key, 32);
+	memcpy(st->nonce, nonce24, 24);
+#ifndef USE_SODIUM
+	{
+		unsigned char sigma_[16];
+		memcpy(sigma_, "expand 32-byte k", 16);
+		crypto_core_hsalsa20(st->subkey, st->nonce, st->key, sigma_);
+	}
+#endif
+	st->block_counter = 0;
+	st->leftover_len = 0;
+}
 static void ctr_init(struct ctr_stream *st, const char *label, const char *nonce) {
 	unsigned char n24full[32];
 	derive_key(label, nonce, st->key);
@@ -334,6 +347,179 @@ static int recv_line(int fd, char *buf, size_t cap, size_t *out_len) {
 	buf[n] = 0;
 	if(out_len) *out_len = n;
 	return 0;
+}
+
+/* ---- nt02 binary framing ----
+   Frame: [type:1][len:2 BE][payload len]. Max payload 65535.
+   Types: 1=SERVER_HELLO 2=CLIENT_HELLO 3=CONTROL 4=TUNNEL
+          5=ERROR 6=CLOSE. Tunnel frames carry <=16384 app bytes. */
+#define FT_SH 1
+#define FT_CH 2
+#define FT_CTRL 3
+#define FT_TUNNEL 4
+#define FT_ERROR 5
+#define FT_CLOSE 6
+#define NT_MAGIC "NT02"
+#define MAX_FRAME 65535
+
+static int send_frame(int fd, unsigned char type, const void *payload, size_t len) {
+	unsigned char hdr[3];
+	hdr[0] = type;
+	hdr[1] = (unsigned char)(len >> 8);
+	hdr[2] = (unsigned char)(len & 0xff);
+	if(send_all(fd, hdr, 3) < 0) return -1;
+	if(len && send_all(fd, payload, len) < 0) return -1;
+	return 0;
+}
+
+static int recv_frame(int fd, unsigned char *type, unsigned char *payload, size_t cap, size_t *out_len) {
+	unsigned char hdr[3];
+	if(recv_exact(fd, hdr, 3) < 0) return -1;
+	*type = hdr[0];
+	size_t len = ((size_t)hdr[1] << 8) | hdr[2];
+	if(len > cap) return -1;
+	if(len && recv_exact(fd, payload, len) < 0) return -1;
+	if(out_len) *out_len = len;
+	return 0;
+}
+
+static void send_error_close(int fd, unsigned char code) {
+	unsigned char payload[2];
+	payload[0] = code;
+	send_frame(fd, FT_ERROR, payload, 1);
+}
+
+/* ---- key material ----
+   Server longterm Ed25519: pk 32, sk 64 (tweet format: seed+pk).
+   Client pins server pk hex. Ephemeral X25519 per connection. */
+static int hex_parse(const char *hex, unsigned char *out, size_t outlen);
+static unsigned char g_server_pk[32];
+static unsigned char g_server_sk[64];
+static int g_have_server_key;
+static unsigned char g_pinned_pk[32];
+static int g_have_pin;
+static int g_allow_cleartext = 1;
+
+static int load_server_key(const char *path) {
+	int fd = open(path, 0);
+	if(fd < 0) { perror(path); return -1; }
+	char pkhex[65];
+	unsigned char sk[64];
+	ssize_t n = read(fd, pkhex, 64);
+	if(n != 64) { fprintf(stderr, "bad key file (need 64 hex pk chars)\n"); return -1; }
+	pkhex[64] = 0;
+	if(hex_parse(pkhex, g_server_pk, 32) < 0) { fprintf(stderr, "bad pk hex in key file\n"); return -1; }
+	/* skip newline if present, then read binary sk or hex sk */
+	{
+		char c;
+		ssize_t r = read(fd, &c, 1);
+		if(r == 1 && c != '\n' && c != '\r') {
+			/* c is first byte of binary sk */
+			sk[0] = (unsigned char)c;
+			n = read(fd, sk+1, 63);
+			if(n != 63) { fprintf(stderr, "short sk in key file\n"); return -1; }
+		} else {
+			n = read(fd, sk, 64);
+			if(n != 64) { fprintf(stderr, "short sk in key file\n"); return -1; }
+		}
+	}
+	close(fd);
+	memcpy(g_server_sk, sk, 64);
+	memset(sk, 0, sizeof sk);
+	g_have_server_key = 1;
+	return 0;
+}
+
+static void x25519_base(unsigned char *out, const unsigned char *sk) {
+#ifdef USE_SODIUM
+	crypto_scalarmult_base(out, sk);
+#else
+	crypto_scalarmult_curve25519_tweet_base(out, sk);
+#endif
+}
+static void x25519_mul(unsigned char *out, const unsigned char *sk, const unsigned char *pk) {
+#ifdef USE_SODIUM
+	crypto_scalarmult(out, sk, pk);
+#else
+	crypto_scalarmult_curve25519_tweet(out, sk, pk);
+#endif
+}
+static unsigned char g_sign_buf[128];
+static int ed_sign(unsigned char *sig, const unsigned char *msg, size_t len) {
+	unsigned long long slen = 0;
+	int r;
+#ifdef USE_SODIUM
+	r = crypto_sign(g_sign_buf, &slen, msg, len, g_server_sk);
+#else
+	r = crypto_sign_ed25519_tweet(g_sign_buf, &slen, msg, len, g_server_sk);
+#endif
+	if(r) return r;
+	memcpy(sig, g_sign_buf, 64);
+	return 0;
+}
+static int ed_verify(const unsigned char *sig, const unsigned char *msg, size_t len) {
+	/* TweetNaCl open expects m to be writable (it copies sm into
+	   m in place). Sodium's open accepts m=NULL. Allocate real
+	   buffer for both. */
+	unsigned char sm[192];
+	unsigned char outmsg[192];
+	unsigned long long mlen = 0;
+	int r;
+	memcpy(sm, sig, 64);
+	memcpy(sm + 64, msg, len);
+#ifdef USE_SODIUM
+	r = crypto_sign_open(outmsg, &mlen, sm, 64 + len, g_pinned_pk);
+#else
+	r = crypto_sign_ed25519_tweet_open(outmsg, &mlen, sm, 64 + len, g_pinned_pk);
+#endif
+	return r;
+}
+
+/* transcript = MAGIC(4) + eph_s(32) + eph_c(32) + cap(1) + nonce(16) + req(1) = 86 */
+static void transcript_hash(const unsigned char *eph_s, const unsigned char *eph_c, unsigned char cap, const unsigned char *nonce, unsigned char req, unsigned char out[32]) {
+	sha256_ctx ctx;
+	sha256_init(&ctx);
+	sha256_update(&ctx, (const unsigned char*)NT_MAGIC, 4);
+	sha256_update(&ctx, eph_s, 32);
+	sha256_update(&ctx, eph_c, 32);
+	sha256_update(&ctx, &cap, 1);
+	sha256_update(&ctx, nonce, 16);
+	sha256_update(&ctx, &req, 1);
+	sha256_final(&ctx, out);
+}
+static void auth_mac(const unsigned char *shared, const unsigned char *thash, unsigned char req, unsigned char out[32]) {
+	unsigned char auth_key[32];
+	sha256_ctx ctx;
+	sha256_init(&ctx);
+	sha256_update(&ctx, (const unsigned char*)"auth", 4);
+	sha256_update(&ctx, shared, 32);
+	sha256_update(&ctx, (const unsigned char*)g_secret, g_secret_len);
+	sha256_final(&ctx, auth_key);
+	sha256_init(&ctx);
+	sha256_update(&ctx, auth_key, 32);
+	sha256_update(&ctx, thash, 32);
+	sha256_update(&ctx, &req, 1);
+	sha256_final(&ctx, out);
+	memset(auth_key, 0, sizeof auth_key);
+}
+/* stream keys from shared + transcript (forward secret) */
+static void stream_keys(const unsigned char *shared, const unsigned char *thash, unsigned char up[32], unsigned char dn[32], unsigned char n24[32]) {
+	sha256_ctx ctx;
+	sha256_init(&ctx);
+	sha256_update(&ctx, (const unsigned char*)"enc-up", 6);
+	sha256_update(&ctx, shared, 32);
+	sha256_update(&ctx, thash, 32);
+	sha256_final(&ctx, up);
+	sha256_init(&ctx);
+	sha256_update(&ctx, (const unsigned char*)"enc-dn", 6);
+	sha256_update(&ctx, shared, 32);
+	sha256_update(&ctx, thash, 32);
+	sha256_final(&ctx, dn);
+	sha256_init(&ctx);
+	sha256_update(&ctx, (const unsigned char*)"enc-nonce", 9);
+	sha256_update(&ctx, shared, 32);
+	sha256_update(&ctx, thash, 32);
+	sha256_final(&ctx, n24);
 }
 
 /* resolve host like microsocks/server.c resolve(), but without AI_PASSIVE
@@ -467,6 +653,7 @@ struct tunnel {
 	pthread_t pt;
 	volatile int done;
 	int enc; /* 0 = cleartext skt, 1 = encrypted sk2 */
+	int framed_fd; /* nt02 spare fd carrying frames, -1 = raw */
 	struct ctr_stream enc_up; /* fds -> fdc */
 	struct ctr_stream enc_dn; /* fdc -> fds */
 };
@@ -502,7 +689,30 @@ static void *tunnel_thread(void *data) {
 			continue;
 		}
 		char buf[BUFSZ];
-		ssize_t n = recv(infd, buf, sizeof buf, 0);
+		unsigned char ftype;
+		unsigned char fbuf[BUFSZ];
+		size_t flen = 0;
+		ssize_t n;
+		if(infd == t->framed_fd) {
+			/* framed spare side: expect FT_TUNNEL frames */
+			if(recv_frame(infd, &ftype, fbuf, BUFSZ, &flen) < 0) {
+				if(infd == t->fds) open0 = 0;
+				else open1 = 0;
+				shutdown(outfd, SHUT_WR);
+				continue;
+			}
+			if(ftype == FT_CLOSE) {
+				if(infd == t->fds) open0 = 0;
+				else open1 = 0;
+				shutdown(outfd, SHUT_WR);
+				continue;
+			}
+			if(ftype != FT_TUNNEL) break;
+			n = (ssize_t)flen;
+			memcpy(buf, fbuf, flen);
+		} else {
+			n = recv(infd, buf, sizeof buf, 0);
+		}
 		if(n < 0) {
 			if(errno == EINTR) continue;
 			n = 0;
@@ -514,24 +724,26 @@ static void *tunnel_thread(void *data) {
 			continue;
 		}
 		if(t->enc) {
-			/* Same direction mapping as Python: enc_up is
-			   fds->fdc, enc_dn is fdc->fds on both ends. */
 			if(infd == t->fds) ctr_crypt(&t->enc_up, (unsigned char*)buf, (size_t)n);
 			else ctr_crypt(&t->enc_dn, (unsigned char*)buf, (size_t)n);
 		}
-		size_t sent = 0;
-		int failed = 0;
-		while(sent < (size_t)n) {
-			ssize_t m = send(outfd, buf+sent, (size_t)n-sent, 0);
-			if(m < 0) {
-				if(errno == EINTR) continue;
-				failed = 1;
-				break;
+		if(outfd == t->framed_fd) {
+			if(send_frame(outfd, FT_TUNNEL, buf, (size_t)n) < 0) break;
+		} else {
+			size_t sent = 0;
+			int failed = 0;
+			while(sent < (size_t)n) {
+				ssize_t m = send(outfd, buf+sent, (size_t)n-sent, 0);
+				if(m < 0) {
+					if(errno == EINTR) continue;
+					failed = 1;
+					break;
+				}
+				if(m == 0) { failed = 1; break; }
+				sent += (size_t)m;
 			}
-			if(m == 0) { failed = 1; break; }
-			sent += (size_t)m;
+			if(failed) break;
 		}
-		if(failed) break;
 	}
 	if(t->fdc >= 0) close(t->fdc);
 	if(t->fds >= 0) close(t->fds);
@@ -541,18 +753,22 @@ static void *tunnel_thread(void *data) {
 	return 0;
 }
 
-static int tunnel_start(struct tunnel **slot, int fds, int fdc, int enc, const char *nonce) {
+static unsigned char g_tun_up[32], g_tun_dn[32], g_tun_n24[32];
+static struct ctr_stream g_ctl_up, g_ctl_dn; /* control channel streams */
+static int g_ctl_valid;
+static int tunnel_start(struct tunnel **slot, int fds, int fdc, int enc, int framed_fd) {
 	struct tunnel *t = malloc(sizeof *t);
 	if(!t) return -1;
 	t->fds = fds;
 	t->fdc = fdc;
 	t->done = 0;
 	t->enc = enc;
+	t->framed_fd = framed_fd;
 	tunnel_sock(fds);
 	tunnel_sock(fdc);
 	if(enc) {
-		ctr_init(&t->enc_up, "enc-up", nonce);
-		ctr_init(&t->enc_dn, "enc-dn", nonce);
+		ctr_init_ex(&t->enc_up, g_tun_up, g_tun_n24);
+		ctr_init_ex(&t->enc_dn, g_tun_dn, g_tun_n24);
 	}
 	/* Ported from microsocks sockssrv.c: pthread_attr with a
 	   fixed stack size. If attr init fails we fall back to
@@ -585,7 +801,7 @@ static void tunnel_reap(struct tunnel ***arr, size_t *count) {
 	}
 }
 
-static int tunnel_add(struct tunnel ***arr, size_t *count, size_t *cap, int fds, int fdc, int enc, const char *nonce) {
+static int tunnel_add(struct tunnel ***arr, size_t *count, size_t *cap, int fds, int fdc, int enc, int framed_fd) {
 	if(*count == *cap) {
 		size_t ncap = *cap ? *cap * 2 : 8;
 		struct tunnel **nt = realloc(*arr, ncap * sizeof *nt);
@@ -593,61 +809,102 @@ static int tunnel_add(struct tunnel ***arr, size_t *count, size_t *cap, int fds,
 		*arr = nt;
 		*cap = ncap;
 	}
-	if(tunnel_start(&(*arr)[*count], fds, fdc, enc, nonce) != 0) return -1;
+	if(tunnel_start(&(*arr)[*count], fds, fdc, enc, framed_fd) != 0) return -1;
 	(*count)++;
+	return 0;
+}
+
+static void ctl_init_from(const unsigned char *shared, const unsigned char *thash) {
+	unsigned char up[32], dn[32], n24[32];
+	stream_keys(shared, thash, up, dn, n24);
+	ctr_init_ex(&g_ctl_up, up, n24);
+	ctr_init_ex(&g_ctl_dn, dn, n24);
+	g_ctl_valid = 1;
+}
+static void tun_init_from(const unsigned char *shared, const unsigned char *thash) {
+	stream_keys(shared, thash, g_tun_up, g_tun_dn, g_tun_n24);
+}
+/* nt02 handshake: returns fd + fills req_out, framed_fd is fd itself on return.
+   req_out: 0 adm, 1 skt, 2 sk2. Side effect: sets g_ctl_* for adm,
+   g_tun_* for spare (via tun_init_from). */
+static int nt02_handshake(int fd, unsigned char req, int *enc_out) {
+	unsigned char eph_sk[32], eph_pk[32];
+	randombytes(eph_sk, 32);
+	x25519_base(eph_pk, eph_sk);
+	unsigned char nonce[16];
+	randombytes(nonce, 16);
+	unsigned char shared[32], thash[32], mac[32];
+	if(req == 0) {
+		/* server side adm is handled in server_wait_conn_up_new;
+		   this helper is client side only */
+	}
+	(void)fd; (void)req; (void)enc_out; (void)eph_pk; (void)shared; (void)thash; (void)mac;
 	return 0;
 }
 
 /* ---- NAT client ---- */
 
-static int client_setup_sock(const char *upstream_ip, unsigned short upstream_port, const char *cmd, char *nonce_out) {
+static int client_setup_sock(const char *upstream_ip, unsigned short upstream_port, unsigned char req) {
 	int fd = connect_to(upstream_ip, upstream_port);
-	if(fd < 0) {
-		perror("connect upstream");
-		return -1;
+	if(fd < 0) { perror("connect upstream"); return -1; }
+	/* recv SERVER_HELLO frame */
+	unsigned char ftype;
+	unsigned char payload[MAX_FRAME];
+	size_t plen = 0;
+	if(recv_frame(fd, &ftype, payload, MAX_FRAME, &plen) < 0 || ftype != FT_SH || plen != 117) {
+		fprintf(stderr, "bad server hello\n");
+		close(fd); return -1;
 	}
-	char linebuf[NONCE_HEX_LEN + 2];
-	/* python: sock.recv(NONCE_LEN*2+1).rstrip(b'\n') via Rocksock.recv(count) which
-	   reads exactly count bytes or raises on EOF. The server sends nonce + '\n'. */
-	if(recv_exact(fd, linebuf, NONCE_HEX_LEN + 1) < 0) {
-		perror("recv nonce");
-		close(fd);
-		return -1;
+	const unsigned char *sh_payload = payload;
+	if(memcmp(sh_payload, NT_MAGIC, 4) != 0) { fprintf(stderr, "bad magic\n"); close(fd); return -1; }
+	const unsigned char *eph_s = sh_payload + 4;
+	unsigned char cap = sh_payload[36];
+	const unsigned char *nonce = sh_payload + 37;
+	const unsigned char *sig = sh_payload + 53;
+	/* verify signature over MAGIC+eph_s+cap+nonce (53 bytes) */
+	if(ed_verify(sig, sh_payload, 53) != 0) {
+		fprintf(stderr, "server signature verify failed\n");
+		send_error_close(fd, 2);
+		close(fd); return -1;
 	}
-	linebuf[NONCE_HEX_LEN + 1] = 0;
-	/* strip trailing newline(s) like rstrip(b'\n') - nonce is hex, safe */
-	size_t nl = NONCE_HEX_LEN;
-	while(nl > 0 && linebuf[nl] == '\n') { linebuf[nl] = 0; nl--; }
-	char expect[HASH_HEX_LEN + 1];
-	compute_hash(cmd, linebuf, expect);
-	/* hash + '\n' */
-	char out[HASH_HEX_LEN + 2];
-	memcpy(out, expect, HASH_HEX_LEN);
-	out[HASH_HEX_LEN] = '\n';
-	out[HASH_HEX_LEN+1] = 0;
-	if(send_all(fd, out, HASH_HEX_LEN + 1) < 0) {
-		perror("send hash");
-		close(fd);
-		return -1;
+	/* our ephemeral */
+	unsigned char eph_sk[32], eph_c[32];
+	randombytes(eph_sk, 32);
+	x25519_base(eph_c, eph_sk);
+	unsigned char shared[32], thash[32], mac[32];
+	x25519_mul(shared, eph_sk, eph_s);
+	transcript_hash(eph_s, eph_c, cap, nonce, req, thash);
+	auth_mac(shared, thash, req, mac);
+	unsigned char ch_payload[65];
+	memcpy(ch_payload, eph_c, 32);
+	ch_payload[32] = req;
+	memcpy(ch_payload + 33, mac, 32);
+	if(send_frame(fd, FT_CH, ch_payload, 65) < 0) { close(fd); return -1; }
+	/* keys */
+	if(req == 0) {
+		ctl_init_from(shared, thash);
+	} else {
+		tun_init_from(shared, thash);
 	}
+	memset(eph_sk, 0, sizeof eph_sk);
+	memset(shared, 0, sizeof shared);
 	opt_sock(fd);
-	if(nonce_out) strcpy(nonce_out, linebuf);
 	return fd;
 }
 
 static void client_doit(const char *upstream_ip, unsigned short upstream_port, const char *local_ip, unsigned short local_port) {
-	char next_nonce[NONCE_HEX_LEN+1];
-	int control = client_setup_sock(upstream_ip, upstream_port, "adm", 0);
+		int control = client_setup_sock(upstream_ip, upstream_port, 0);
 	if(control < 0) return;
-	int next = client_setup_sock(upstream_ip, upstream_port, "sk2", next_nonce);
+	int next = client_setup_sock(upstream_ip, upstream_port, 2);
 	if(next < 0) { close(control); return; }
 	struct tunnel **threads = 0;
 	size_t nthreads = 0, capthreads = 0;
 	while(1) {
 		tunnel_reap(&threads, &nthreads);
-		char line[4096];
+		unsigned char ftype;
+		unsigned char line[4096];
 		size_t linelen = 0;
-		if(recv_line(control, line, sizeof line, &linelen) < 0 || !linelen || line[linelen-1] != '\n') {
+		if(recv_frame(control, &ftype, line, sizeof line, &linelen) < 0 || ftype == FT_ERROR || ftype == FT_CLOSE || !g_ctl_valid) {
 			/* Lost control (matches py fix): old C code broke out
 			   and exited, killing all tunnels. Tear down control+
 			   spare and re-handshake with backoff. */
@@ -662,21 +919,24 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 				ts.tv_sec = 2;
 				ts.tv_nsec = 0;
 				nanosleep(&ts, 0);
-				control = client_setup_sock(upstream_ip, upstream_port, "adm", 0);
+				control = client_setup_sock(upstream_ip, upstream_port, 0);
 				if(control < 0) continue;
-				next = client_setup_sock(upstream_ip, upstream_port, "sk2", next_nonce);
+				next = client_setup_sock(upstream_ip, upstream_port, 2);
 				if(next < 0) { close(control); control = -1; }
 			}
 			continue;
 		}
+		if(ftype != FT_CTRL) continue;
+		ctr_crypt(&g_ctl_dn, line, linelen);
+		line[linelen] = 0;
 		print_timestamp();
-		fputs(line, stdout);
-		if(linelen && line[linelen-1] != '\n') fputc('\n', stdout);
+		fputs((char*)line, stdout);
+		fputc('\n', stdout);
 		fflush(stdout);
-		if(strncmp(line, "CONN:", 5) == 0) {
+		if(strncmp((char*)line, "CONN:", 5) == 0) {
 			/* Parse CONN:ip:port or CONN:[v6]:port (matches py fix).
 			   Address is unused beyond this in both programs. */
-			char *p = line + 5;
+			char *p = (char*)line + 5;
 			if(*p == '[') {
 				char *rb = strchr(p, ']');
 				if(!rb) continue;
@@ -695,21 +955,21 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 				   that the server had paired with it. Drop the
 				   spare, arm a fresh one, and continue. */
 				if(next >= 0) close(next);
-				next = client_setup_sock(upstream_ip, upstream_port, "sk2", next_nonce);
+				next = client_setup_sock(upstream_ip, upstream_port, 2);
 				continue;
 			}
 			if(!spare_alive(next)) {
 				printf("spare socket dead, re-arming\n");
 				fflush(stdout);
 				close(next);
-				next = client_setup_sock(upstream_ip, upstream_port, "sk2", next_nonce);
+				next = client_setup_sock(upstream_ip, upstream_port, 2);
 				continue;
 			}
-			if(tunnel_add(&threads, &nthreads, &capthreads, local, next, 1, next_nonce) < 0) {
+			if(tunnel_add(&threads, &nthreads, &capthreads, local, next, 1, next) < 0) {
 				close(local); close(next);
 				continue;
 			}
-			next = client_setup_sock(upstream_ip, upstream_port, "sk2", next_nonce);
+			next = client_setup_sock(upstream_ip, upstream_port, 2);
 			if(next < 0) break;
 		}
 	}
@@ -718,73 +978,84 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 /* ---- NAT server ---- */
 
 static int server_wait_conn_up(int su, int *control, int *next_up, int *next_enc, char *next_nonce) {
+	(void)next_nonce;
 	union sockaddr_union addr;
 	socklen_t alen = sizeof addr;
 	int conn = accept(su, (struct sockaddr*)&addr, &alen);
 	if(conn < 0) return -1;
-	/* Handshake timeout (matches py fix): a client that
-	   connects and sends nothing must not freeze the server. */
 	{
 		struct timeval tv;
 		tv.tv_sec = 10;
 		tv.tv_usec = 0;
 		setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 	}
-	char nonce[NONCE_HEX_LEN+1];
-	get_nonce(nonce);
 	char addrstr[64];
 	format_addr(&addr, addrstr, sizeof addrstr);
+	/* SERVER_HELLO: MAGIC + eph_pk + cap + nonce(16) + sig(64) = 117 */
+	unsigned char eph_sk[32], eph_pk[32];
+	randombytes(eph_sk, 32);
+	x25519_base(eph_pk, eph_sk);
+	unsigned char nonce[16];
+	randombytes(nonce, 16);
+	unsigned char cap = g_allow_cleartext ? 1 : 0;
+	unsigned char sh[117];
+	memcpy(sh, NT_MAGIC, 4);
+	memcpy(sh+4, eph_pk, 32);
+	sh[36] = cap;
+	memcpy(sh+37, nonce, 16);
+	if(ed_sign(sh+53, sh, 53) != 0) { close(conn); return -1; }
 	print_timestamp();
-	printf("CONN: %s (nonce: %s) ... ", addrstr, nonce);
+	printf("CONN: %s ... ", addrstr);
 	fflush(stdout);
-	char out[NONCE_HEX_LEN+2];
-	memcpy(out, nonce, NONCE_HEX_LEN);
-	out[NONCE_HEX_LEN] = '\n';
-	out[NONCE_HEX_LEN+1] = 0;
-	if(send_all(conn, out, NONCE_HEX_LEN+1) < 0) { close(conn); printf("rejected!\n"); return 0; }
-	char cmdbuf[HASH_HEX_LEN+2];
-	/* python: conn.recv(1+hashlen).rstrip(b'\n') - plain recv, may be short.
-	   We read exactly hashlen+1; a short read is a rejected client. */
-	if(recv_exact(conn, cmdbuf, HASH_HEX_LEN+1) < 0) { printf("rejected!\n"); close(conn); return 0; }
+	if(send_frame(conn, FT_SH, sh, 117) < 0) { close(conn); printf("rejected!\n"); return 0; }
+	unsigned char ftype;
+	unsigned char ch[65];
+	size_t plen = 0;
+	if(recv_frame(conn, &ftype, ch, 65, &plen) < 0 || ftype != FT_CH || plen != 65) {
+		printf("rejected!\n"); close(conn); return 0;
+	}
 	{
 		struct timeval tv;
-		tv.tv_sec = 0;
-		tv.tv_usec = 0;
+		tv.tv_sec = 0; tv.tv_usec = 0;
 		setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 	}
-	cmdbuf[HASH_HEX_LEN+1] = 0;
-	size_t cl = HASH_HEX_LEN+1;
-	while(cl > 0 && cmdbuf[cl-1] == '\n') { cmdbuf[--cl] = 0; }
-	char expect[HASH_HEX_LEN+1];
-	compute_hash("adm", nonce, expect);
-	if(cl == HASH_HEX_LEN && ct_equal(cmdbuf, expect, HASH_HEX_LEN)) {
-		opt_sock(conn);
-		if(*control >= 0) close(*control);
-		/* Orphan spare (matches py fix): old code left the
-		   spare from the dead admin session in place. */
+	const unsigned char *eph_c = ch;
+	unsigned char req = ch[32];
+	const unsigned char *mac = ch + 33;
+	if(req > 2) { send_error_close(conn, 1); printf("rejected!\n"); close(conn); return 0; }
+	unsigned char shared[32], thash[32], expect_mac[32];
+	x25519_mul(shared, eph_sk, eph_c);
+	transcript_hash(eph_pk, eph_c, cap, nonce, req, thash);
+	auth_mac(shared, thash, req, expect_mac);
+	if(!ct_equal((char*)mac, (char*)expect_mac, 32)) {
+		send_error_close(conn, 3);
+		printf("rejected!\n"); close(conn); return 0;
+	}
+	memset(eph_sk, 0, sizeof eph_sk);
+	opt_sock(conn);
+	if(req == 0) {
+		if(*control >= 0) { close(*control); }
 		if(*next_up >= 0) { close(*next_up); *next_up = -1; }
 		*control = conn;
+		ctl_init_from(shared, thash);
 		printf("OK (admin)\n");
 	} else {
-		compute_hash("skt", nonce, expect);
-		int is_skt = cl == HASH_HEX_LEN && ct_equal(cmdbuf, expect, HASH_HEX_LEN);
-		compute_hash("sk2", nonce, expect);
-		int is_sk2 = cl == HASH_HEX_LEN && ct_equal(cmdbuf, expect, HASH_HEX_LEN);
-		if(is_skt || is_sk2) {
-			opt_sock(conn);
-			printf("OK (tunnel%s)\n", is_sk2 ? " enc" : "");
-			if(*control < 0) close(conn);
-			else {
-				if(*next_up >= 0) close(*next_up);
-				*next_up = conn;
-				*next_enc = is_sk2;
-				if(next_nonce) strcpy(next_nonce, nonce);
-			}
-		} else {
-			printf("rejected!\n");
-			close(conn);
+		int enc = (req == 2);
+		if(!enc && !g_allow_cleartext) {
+			send_error_close(conn, 1);
+			printf("rejected cleartext not allowed\n");
+			close(conn); return 0;
+		}
+		printf("OK (tunnel%s)\n", enc ? " enc" : "");
+		if(*control < 0) close(conn);
+		else {
+			if(*next_up >= 0) close(*next_up);
+			*next_up = conn;
+			*next_enc = enc;
+			tun_init_from(shared, thash);
 		}
 	}
+	memset(shared, 0, sizeof shared);
 	fflush(stdout);
 	return 0;
 }
@@ -844,14 +1115,16 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 				if(conn < 0) continue;
 				char addrstr[64];
 				format_addr(&addr, addrstr, sizeof addrstr);
-				char msg[80];
-				/* python: b"CONN:%s\n" % addr  (no space) */
-				int mlen = snprintf(msg, sizeof msg, "CONN:%s\n", addrstr);
-				if(control < 0 || send_all(control, msg, (size_t)mlen) < 0) {
+				unsigned char msg[80];
+				int mlen = snprintf((char*)msg, sizeof msg, "CONN:%s", addrstr);
+				if(mlen < 0) mlen = 0;
+				if(mlen > (int)sizeof msg) mlen = sizeof msg;
+				ctr_crypt(&g_ctl_dn, msg, (size_t)mlen); /* control is server->client only: both ends use dn stream */
+				if(control < 0 || send_frame(control, FT_CTRL, msg, (size_t)mlen) < 0) {
 					close(conn);
 					continue;
 				}
-				if(tunnel_add(&threads, &nthreads, &capthreads, next_up, conn, next_enc, next_nonce_srv) < 0) {
+				if(tunnel_add(&threads, &nthreads, &capthreads, next_up, conn, next_enc, next_up) < 0) {
 					close(next_up); close(conn);
 					next_up = -1;
 					continue;
@@ -910,6 +1183,23 @@ static void usage(const char *prog) {
 		"Client (IPv6 upstream):\n"
 		"    %s --mode client --secret s3cretP4ss --local localhost:80 --admin [2001:db8::1]:8000\n"
 		"\n"
+		"nt02 wire protocol (binary, length prefixed frames):\n"
+		"server signs ephemeral X25519 key with long term Ed25519 key;\n"
+		"client verifies against pinned --server-pubkey, replies with\n"
+		"ephemeral key plus request byte (0=adm, 1=skt, 2=sk2) plus\n"
+		"MAC over transcript keyed by X25519 shared secret plus\n"
+		"--secret / --secret-file. CONN lines are always encrypted\n"
+		"on the control channel. Server options:\n"
+		"  --server-key FILE     long term signing key (see --genkey)\n"
+		"  --allow-cleartext     accept skt tunnels (default)\n"
+		"  --no-cleartext        reject skt, sk2 only\n"
+		"Client options:\n"
+		"  --server-pubkey HEX   pinned server public key (required)\n"
+		"  --secret-file PATH    read secret from 0600 file, safer\n"
+		"                        than --secret on shared boxes\n"
+		"  --genkey --out FILE   generate Ed25519 keypair (0600),\n"
+		"                        print public key hex for pinning\n"
+		"\n"
 		"For shared boxes prefer --secret-file PATH (0600 file) over\n"
 		"--secret, which leaks via ps aux. Key generation (single\n"
 		"option for both roles, role independent):\n"
@@ -918,7 +1208,7 @@ static void usage(const char *prog) {
 		"--timeout SECS: tunnel socket send/recv timeout in seconds\n"
 		"(0 = no timeout, default 1800). TCP keepalive probes every\n"
 		"30s idle (5s interval, 3 probes) on all sockets.\n",
-		prog, prog, prog, prog, prog);
+		prog, prog, prog, prog, prog, prog);
 }
 
 static int read_secret_file(const char *path) {
@@ -1043,6 +1333,9 @@ int main(int argc, char **argv) {
 	const char *admin_addr = "0.0.0.0:8081";
 	const char *timeout_s = 0;
 	const char *secret_file = 0;
+	const char *server_key = 0;
+	const char *server_pubkey = 0;
+	int allow_clear = -1;
 	int i;
 	for(i=1;i<argc;i++) {
 		if(strcmp(argv[i], "--secret") == 0 && i+1 < argc) secret = argv[++i];
@@ -1052,6 +1345,10 @@ int main(int argc, char **argv) {
 		else if(strcmp(argv[i], "--admin") == 0 && i+1 < argc) admin_addr = argv[++i];
 		else if(strcmp(argv[i], "--timeout") == 0 && i+1 < argc) timeout_s = argv[++i];
 		else if(strcmp(argv[i], "--secret-file") == 0 && i+1 < argc) secret_file = argv[++i];
+		else if(strcmp(argv[i], "--server-key") == 0 && i+1 < argc) server_key = argv[++i];
+		else if(strcmp(argv[i], "--server-pubkey") == 0 && i+1 < argc) server_pubkey = argv[++i];
+		else if(strcmp(argv[i], "--allow-cleartext") == 0) allow_clear = 1;
+		else if(strcmp(argv[i], "--no-cleartext") == 0) allow_clear = 0;
 		else if(strncmp(argv[i], "--secret=", 9) == 0) secret = argv[i]+9;
 		else if(strncmp(argv[i], "--mode=", 7) == 0) mode = argv[i]+7;
 		else if(strncmp(argv[i], "--public=", 9) == 0) public_addr = argv[i]+9;
@@ -1059,6 +1356,8 @@ int main(int argc, char **argv) {
 		else if(strncmp(argv[i], "--admin=", 8) == 0) admin_addr = argv[i]+8;
 		else if(strncmp(argv[i], "--timeout=", 10) == 0) timeout_s = argv[i]+10;
 		else if(strncmp(argv[i], "--secret-file=", 14) == 0) secret_file = argv[i]+14;
+		else if(strncmp(argv[i], "--server-key=", 13) == 0) server_key = argv[i]+13;
+		else if(strncmp(argv[i], "--server-pubkey=", 16) == 0) server_pubkey = argv[i]+16;
 		else {
 			fprintf(stderr, "unrecognized argument: %s\n", argv[i]);
 			return 1;
@@ -1094,6 +1393,16 @@ int main(int argc, char **argv) {
 			size_t j;
 			for(j=0;j<g_secret_len;j++) ((char*)secret)[j] = 0;
 		}
+	}
+	if(allow_clear >= 0) g_allow_cleartext = allow_clear;
+	/* Key requirements: server needs signing key; client needs pin. */
+	if(strcmp(mode, "server") == 0) {
+		if(!server_key) { fprintf(stderr, "server mode requires --server-key FILE (see --genkey)\n"); return 1; }
+		if(load_server_key(server_key) < 0) return 1;
+	} else if(strcmp(mode, "client") == 0) {
+		if(!server_pubkey) { fprintf(stderr, "client mode requires --server-pubkey HEX\n"); return 1; }
+		if(hex_parse(server_pubkey, g_pinned_pk, 32) < 0) { fprintf(stderr, "bad --server-pubkey hex\n"); return 1; }
+		g_have_pin = 1;
 	}
 	signal(SIGPIPE, SIG_IGN);
 	char admin_ip[256];
