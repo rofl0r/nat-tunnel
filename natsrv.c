@@ -310,18 +310,30 @@ static int load_server_key(const char *path) {
 	if(n != 64) { fprintf(stderr, "bad key file (need 64 hex pk chars)\n"); return -1; }
 	pkhex[64] = 0;
 	if(hex_parse(pkhex, g_server_pk, 32) < 0) { fprintf(stderr, "bad pk hex in key file\n"); return -1; }
-	/* skip newline if present, then read binary sk or hex sk */
+	/* second line: hex sk (128 chars, current) or binary sk
+	   (64 bytes, legacy). Peek first bytes to decide. */
 	{
-		char c;
-		ssize_t r = read(fd, &c, 1);
-		if(r == 1 && c != '\n' && c != '\r') {
-			/* c is first byte of binary sk */
-			sk[0] = (unsigned char)c;
-			n = read(fd, sk+1, 63);
-			if(n != 63) { fprintf(stderr, "short sk in key file\n"); return -1; }
+		unsigned char peek[128];
+		n = read(fd, peek, 128);
+		if(n == 128) {
+			int ishex = 1;
+			int i;
+			for(i=0;i<128;i++) {
+				char c = peek[i];
+				if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))) { ishex = 0; break; }
+			}
+			if(ishex && hex_parse((char*)peek, sk, 64) == 0) {
+				/* good, hex path */
+			} else {
+				/* binary path: peek holds first 64+ bytes */
+				memcpy(sk, peek, 64);
+			}
+		} else if(n == 64) {
+			memcpy(sk, peek, 64);
+		} else if(n > 64) {
+			memcpy(sk, peek, 64);
 		} else {
-			n = read(fd, sk, 64);
-			if(n != 64) { fprintf(stderr, "short sk in key file\n"); return -1; }
+			fprintf(stderr, "short sk in key file\n"); return -1;
 		}
 	}
 	close(fd);
@@ -1114,8 +1126,14 @@ static int do_genkey(const char *outpath) {
 	int m = snprintf(buf, sizeof buf, "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
 		pk[0],pk[1],pk[2],pk[3],pk[4],pk[5],pk[6],pk[7],pk[8],pk[9],pk[10],pk[11],pk[12],pk[13],pk[14],pk[15],pk[16],pk[17],pk[18],pk[19],pk[20],pk[21],pk[22],pk[23],pk[24],pk[25],pk[26],pk[27],pk[28],pk[29],pk[30],pk[31]);
 	if(m <= 0 || write(fd, buf, (size_t)m) != m) { perror("write key"); return 1; }
-	if(write(fd, sk, 64) != 64) { perror("write key"); return 1; }
-	if(write(fd, "\n", 1) != 1) { perror("write key"); return 1; }
+	{
+		char hexsk[129];
+		int i;
+		for(i=0;i<64;i++) snprintf(hexsk+2*i, 3, "%02x", sk[i]);
+		hexsk[128] = 0;
+		if(write(fd, hexsk, 128) != 128) { perror("write key"); return 1; }
+		if(write(fd, "\n", 1) != 1) { perror("write key"); return 1; }
+	}
 	close(fd);
 	{
 		char hexpk[65];
