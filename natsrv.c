@@ -310,11 +310,19 @@ static int load_server_key(const char *path) {
 	if(n != 64) { fprintf(stderr, "bad key file (need 64 hex pk chars)\n"); return -1; }
 	pkhex[64] = 0;
 	if(hex_parse(pkhex, g_server_pk, 32) < 0) { fprintf(stderr, "bad pk hex in key file\n"); return -1; }
-	/* second line: hex sk (128 chars, current) or binary sk
-	   (64 bytes, legacy). Peek first bytes to decide. */
+	/* skip newline after pk line (legacy files may lack it) */
 	{
-		unsigned char peek[128];
+		char c;
+		if(read(fd, &c, 1) == 1 && c != '\n' && c != '\r') {
+			sk[0] = (unsigned char)c;
+			if(read(fd, sk+1, 63) != 63) { fprintf(stderr, "short sk\n"); return -1; }
+			goto sk_done;
+		}
+	}
+	{
+		unsigned char peek[129];
 		n = read(fd, peek, 128);
+		peek[n] = 0;
 		if(n == 128) {
 			int ishex = 1;
 			int i;
@@ -336,6 +344,7 @@ static int load_server_key(const char *path) {
 			fprintf(stderr, "short sk in key file\n"); return -1;
 		}
 	}
+sk_done:
 	close(fd);
 	memcpy(g_server_sk, sk, 64);
 	memset(sk, 0, sizeof sk);
@@ -1014,80 +1023,29 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 
 static void usage(const char *prog) {
 	printf(
-		"NAT Tunnel\n"
-		"----------------\n"
-		"If you have access to a server with public IP and unfiltered ports\n"
-		"you can run NAT Tunnel (NT)  server on the server, and NT client\n"
-		"on your box behind NAT.\n"
-		"the server requires 2 open ports: one for communication with the\n"
-		"NT client (--admin), the other for regular clients to connect to\n"
-		"(--public: this is the port you want your users to use).\n"
-		"\n"
-		"The NT client opens a connection to the server's admin ip/port.\n"
-		"As soon as the server receives a new connection, it signals the\n"
-		"NT client, which then creates a new tunnel connection to the\n"
-		"server, which is then connected to the desired service on the\n"
-		"NT client's side (--local)\n"
-		"\n"
-		"The connection between NT Client and NT Server on the admin\n"
-		"interface is protected by a shared secret against unauthorized use.\n"
-		"An adversary who can intercept packets could crack the secret\n"
-		"if it's of insufficient complexity. At least 10 random\n"
-		"characters and numbers are recommended.\n"
-		"\n"
-		"Example:\n"
-		"You have a HTTP server listening on your local machine on port 80.\n"
-		"You want to make it available on your cloud server/VPS/etc's public\n"
-		"IP on port 7000.\n"
-		"We use port 8000 on the cloud server for the control channel.\n"
-		"\n"
-		"Server (IPv4):\n"
-		"    %s --mode server --secret s3cretP4ss --public 0.0.0.0:7000 --admin 0.0.0.0:8000\n"
-		"Client (IPv4):\n"
-		"    %s --mode client --secret s3cretP4ss --local localhost:80 --admin example.com:8000\n"
-		"\n"
-		"IPv6 and addresses:\n"
-		"IPv4 and IPv6 both work. Use host:port, with brackets for\n"
-		"IPv6 literals: [::1]:8080, [2001:db8::1]:7000. A bare IPv6\n"
-		"address without brackets is rejected (ambiguous port).\n"
-		"Host names prefer IPv4 with IPv6 fallback; an explicit\n"
-		"numeric literal always wins for its family. Listen 0.0.0.0\n"
-		"means IPv4 all, :: means IPv6 all. Peers are reported as\n"
-		"ip:port for IPv4 and [ip]:port for IPv6.\n"
-		"\n"
-		"Server (IPv6):\n"
-		"    %s --mode server --secret s3cretP4ss --public [::]:7000 --admin [::]:8000\n"
-		"Client (IPv6 upstream):\n"
-		"    %s --mode client --secret s3cretP4ss --local localhost:80 --admin [2001:db8::1]:8000\n"
-		"\n"
-		"nt02 wire protocol (binary, length prefixed frames):\n"
-		"server signs ephemeral X25519 key with long term Ed25519 key;\n"
-		"client verifies against pinned --server-pubkey, replies with\n"
-		"ephemeral key plus request byte (0=adm, 1=skt, 2=sk2) plus\n"
-		"MAC over transcript keyed by X25519 shared secret plus\n"
-		"--secret / --secret-file. CONN lines are always encrypted\n"
-		"on the control channel. Server options:\n"
-		"  --server-key FILE     long term signing key (see --genkey)\n"
-		"  --allow-cleartext     accept skt tunnels (default)\n"
-		"  --no-cleartext        reject skt, sk2 only\n"
-		"Client options:\n"
-		"  --server-pubkey HEX   pinned server public key (required)\n"
-		"  --secret-file PATH    read secret from 0600 file, safer\n"
-		"                        than --secret on shared boxes\n"
-		"  --genkey --out FILE   generate Ed25519 keypair (0600),\n"
-		"                        print public key hex for pinning\n"
-		"\n"
-		"For shared boxes prefer --secret-file PATH (0600 file) over\n"
-		"--secret, which leaks via ps aux. Key generation (single\n"
-		"option for both roles, role independent):\n"
-		"    %s --genkey --out server.key\n"
-		"\n"
-		"--timeout SECS: tunnel socket send/recv timeout in seconds\n"
-		"(0 = no timeout, default 1800). TCP keepalive probes every\n"
-		"30s idle (5s interval, 3 probes) on all sockets.\n",
-		prog, prog, prog, prog, prog);
+		"usage: %s [options]\n"
+		"  --mode server|client     work mode (required)\n"
+		"  --secret SECRET          shared secret (or --secret-file)\n"
+		"  --secret-file PATH     read secret from 0600 file\n"
+		"  --timeout SECS         tunnel socket timeout, default 1800, 0=none\n"
+		"  --help, -h             show this help\n"
+		"Server only:\n"
+		"  --public HOST:PORT     public listen address (default 0.0.0.0:8080)\n"
+		"  --admin HOST:PORT      admin listen address (default 0.0.0.0:8081)\n"
+		"  --server-key FILE      long term signing key (required, see --genkey)\n"
+		"  --allow-cleartext      accept cleartext tunnels (default)\n"
+		"  --no-cleartext         reject cleartext tunnels, sk2 only\n"
+		"Client only:\n"
+		"  --admin HOST:PORT      server admin address\n"
+		"  --local HOST:PORT      local service address (or unix path /path.sock)\n"
+		"  --server-pubkey HEX    pinned server public key (required)\n"
+		"Key generation (single option, role independent):\n"
+		"  %s --genkey --out FILE generate Ed25519 keypair to FILE (0600),\n"
+		"                           print public key hex for pinning\n"
+		"Addresses: host:port, IPv6 as [::1]:8080, unix path as /tmp/x.sock\n"
+		"Keepalive: TCP probes every 30s idle (5s interval, 3 probes).\n",
+		prog, prog);
 }
-
 static int read_secret_file(const char *path) {
 	int fd = open(path, 0);
 	if(fd < 0) { perror(path); return -1; }
@@ -1191,18 +1149,19 @@ static int parse_ip_port(const char *s, char *ip, size_t ip_cap, unsigned short 
 }
 
 int main(int argc, char **argv) {
-	/* --genkey is a standalone mode: generate a keypair and exit.
-	   Single option for both roles, since Ed25519 generation
-	   is role independent. */
+	/* --genkey FILENAME is a standalone mode: generate a keypair
+	   and exit. Single option for both roles. The old
+	   --genkey --out FILE form still works. */
 	if(argc >= 2 && strcmp(argv[1], "--genkey") == 0) {
 		const char *outpath = 0;
 		int i;
 		for(i=2;i<argc;i++) {
 			if(strcmp(argv[i], "--out") == 0 && i+1 < argc) outpath = argv[++i];
 			else if(strncmp(argv[i], "--out=", 6) == 0) outpath = argv[i]+6;
-			else { fprintf(stderr, "unrecognized argument: %s\n", argv[i]); return 1; }
+			else if(outpath) { fprintf(stderr, "unrecognized argument: %s\n", argv[i]); return 1; }
+			else outpath = argv[i];
 		}
-		if(!outpath) { fprintf(stderr, "--genkey requires --out FILE\n"); return 1; }
+		if(!outpath) { fprintf(stderr, "--genkey requires a filename: --genkey FILENAME\n"); return 1; }
 		return do_genkey(outpath);
 	}
 	if(argc < 2 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
@@ -1222,6 +1181,7 @@ int main(int argc, char **argv) {
 	const char *server_key = 0;
 	const char *server_pubkey = 0;
 	int allow_clear = -1;
+	int silent_argv = 0;
 	int i;
 	for(i=1;i<argc;i++) {
 		if(strcmp(argv[i], "--secret") == 0 && i+1 < argc) secret = argv[++i];
@@ -1233,6 +1193,7 @@ int main(int argc, char **argv) {
 		else if(strcmp(argv[i], "--secret-file") == 0 && i+1 < argc) secret_file = argv[++i];
 		else if(strcmp(argv[i], "--server-key") == 0 && i+1 < argc) server_key = argv[++i];
 		else if(strcmp(argv[i], "--server-pubkey") == 0 && i+1 < argc) server_pubkey = argv[++i];
+		else if(strcmp(argv[i], "--silent-argv") == 0) silent_argv = 1;
 		else if(strcmp(argv[i], "--allow-cleartext") == 0) allow_clear = 1;
 		else if(strcmp(argv[i], "--no-cleartext") == 0) allow_clear = 0;
 		else if(strncmp(argv[i], "--secret=", 9) == 0) secret = argv[i]+9;
@@ -1272,6 +1233,8 @@ int main(int argc, char **argv) {
 	}
 	if(secret_file) {
 		if(read_secret_file(secret_file) < 0) return 1;
+	} else if(g_secret) {
+		/* already copied from argv above */
 	} else {
 		g_secret = secret;
 		g_secret_len = strlen(secret);
@@ -1282,6 +1245,48 @@ int main(int argc, char **argv) {
 		{
 			size_t j;
 			for(j=0;j<g_secret_len;j++) ((char*)secret)[j] = 0;
+		}
+	}
+	/* Copy secret out of argv first: --silent-argv zeroes argv[]
+	   afterwards, so pointers into argv must not be used after. */
+	if(secret) {
+		size_t n = strlen(secret);
+		if(n >= sizeof g_secret_buf) { fprintf(stderr, "secret too long\n"); return 1; }
+		memcpy(g_secret_buf, secret, n+1);
+		g_secret = g_secret_buf;
+		g_secret_len = n;
+		secret = 0;
+	}
+	if(silent_argv) {
+		/* Clear all argv strings for stealth (ps aux). Note:
+		   the kernel already exposed them at exec time; this
+		   only helps against later inspection, not the race
+		   window. Prefer --secret-file and --server-key.
+		   All options used after this point have been copied
+		   to static storage above (secret) or must be copied
+		   here before zeroing. Copy remaining pointers now. */
+		static char bufs[8][512];
+		int nb = 0;
+		const char **slots[8] = { &mode, &public_addr, &local_addr,
+			&admin_addr, &timeout_s, &server_key, &server_pubkey, 0 };
+		int k;
+		for(k=0; slots[k] && nb < 8; k++) {
+			const char *v = *slots[k];
+			if(v) {
+				size_t n = strlen(v);
+				if(n >= sizeof bufs[nb]) n = sizeof bufs[nb]-1;
+				memcpy(bufs[nb], v, n);
+				bufs[nb][n] = 0;
+				*slots[k] = bufs[nb];
+				nb++;
+			}
+		}
+		{
+			int j;
+			for(j=1;j<argc;j++) {
+				size_t n = strlen(argv[j]);
+				memset(argv[j], 0, n);
+			}
 		}
 	}
 	if(allow_clear >= 0) g_allow_cleartext = allow_clear;
