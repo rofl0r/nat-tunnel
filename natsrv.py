@@ -49,6 +49,51 @@ def _enc_keys(secret, nonce):
 	return (hashlib.sha256(b'enc-up' + secret + nonce).digest(),
 	        hashlib.sha256(b'enc-dn' + secret + nonce).digest())
 
+# Tunnel socket timeouts (seconds, 0 = no timeout). Set from
+# --timeout on the command line. Default 1800 is conservative:
+# a slow llama.cpp server generating at <10 tok/s can go a long
+# time without sending, and a huge system prompt upload can
+# block on send for a long time. A shorter value kills such
+# tunnels; a longer value delays dead-spare detection.
+_tunnel_timeout = 1800
+
+def _opt_sock(sock):
+	# Apply keepalive + timeouts to a raw socket. Keepalive is
+	# tuned (30s idle, 5s interval, 3 probes) so a silently dead
+	# spare is detected in ~45s instead of the 2h default.
+	try:
+		sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+		if hasattr(socket, 'TCP_KEEPIDLE'):
+			sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+		if hasattr(socket, 'TCP_KEEPINTVL'):
+			sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+		if hasattr(socket, 'TCP_KEEPCNT'):
+			sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+	except OSError:
+		pass
+	return sock
+
+def _tunnel_sock(sock):
+	# Tunnel data sockets only: keepalive plus send/recv timeouts.
+	# Never apply the recv timeout to the control socket, whose
+	# recvline() must block indefinitely while idle.
+	_opt_sock(sock)
+	if _tunnel_timeout:
+		try:
+			sock.settimeout(_tunnel_timeout)
+		except OSError:
+			pass
+	return sock
+
+def _spare_alive(sock):
+	# Zero timeout poll: readable spare means FIN/RST/stray data,
+	# i.e. dead for our purposes. Unreadable means still alive.
+	try:
+		r, _, _ = select.select([sock], [], [], 0)
+		return not r
+	except (ValueError, OSError):
+		return False
+
 # CONN address format: IPv4 is "1.2.3.4:1234", IPv6 is "[::1]:1234".
 # The brackets are required: a bare IPv6 address contains colons,
 # so split(b':') cannot tell address from port. Use a pre-compiled
@@ -140,6 +185,13 @@ class Tunnel():
 		self._cleanup()
 		self.done.set()
 	def start(self):
+		# Tunnel sockets get keepalive + timeouts. Note: the
+		# send/recv in _threadfunc uses select+recv/sendall on
+		# blocking sockets; settimeout makes a blocked sendall
+		# fail after _tunnel_timeout instead of hanging forever.
+		for s_ in (self.fds, self.fdc):
+			if s_ is not None:
+				_tunnel_sock(s_)
 		self.t = threading.Thread(target=self._threadfunc)
 		self.t.daemon = True
 		self.t.start()
@@ -166,6 +218,7 @@ class NATClient():
 		# Rocksock has send(), not sendall(); its send() already
 		# calls the underlying socket sendall().
 		sock.send(_hash(cmd + self.secret + nonce) + b'\n')
+		_opt_sock(sock.sock)
 		return sock, nonce
 
 	def _reconnect(self):
@@ -235,6 +288,21 @@ class NATClient():
 						except Exception:
 							pass
 						self.next_csock = None
+					try:
+						self.next_csock, self.next_nonce = self._setup_sock(b'sk2')
+					except Exception:
+						print(_timestamp() + b'lost spare socket, reconnecting')
+						self._reconnect()
+					continue
+				if not _spare_alive(self.next_csock.sock):
+					# Spare died while idle (FIN/RST already
+					# arrived). Drop it, let the server notice
+					# on its select, arm a fresh spare.
+					print(_timestamp() + b'spare socket dead, re-arming')
+					try:
+						self.next_csock.disconnect()
+					except Exception:
+						pass
 					try:
 						self.next_csock, self.next_nonce = self._setup_sock(b'sk2')
 					except Exception:
@@ -345,6 +413,7 @@ class NATSrv():
 		cmd = cmd.rstrip(b'\n')
 		if hmac.compare_digest(cmd, _hash(b'adm' + self.secret + nonce)):
 			conn.settimeout(None)
+			_opt_sock(conn)
 			if self.control_socket:
 				self.control_socket.close()
 			# Orphan spare bug: a new admin replaced the control
@@ -361,6 +430,7 @@ class NATSrv():
 			print("OK (admin)")
 		elif hmac.compare_digest(cmd, _hash(b'skt' + self.secret + nonce)) or hmac.compare_digest(cmd, _hash(b'sk2' + self.secret + nonce)):
 			conn.settimeout(None)
+			_opt_sock(conn)
 			enc_req = hmac.compare_digest(cmd, _hash(b'sk2' + self.secret + nonce))
 			print("OK (tunnel%s)" % (" enc" if enc_req else ""))
 			if not self.control_socket:
@@ -378,6 +448,17 @@ class NATSrv():
 
 	def wait_conn_client(self):
 		conn, addr = self.sc.accept()
+		if not _spare_alive(self.next_upstream_socket[0]):
+			# Spare died while idle; drop it and let the caller
+			# wait for a new one instead of pairing a dead socket.
+			print("lost spare upstream socket")
+			try:
+				self.next_upstream_socket[0].close()
+			except OSError:
+				pass
+			self.next_upstream_socket = None
+			conn.close()
+			return
 		self.control_socket.sendall(b"CONN:%s\n"%_format_addr(addr))
 		spare, spare_nonce, enc_req = self.next_upstream_socket
 		enc = None
@@ -489,7 +570,9 @@ if __name__ == "__main__":
 	parser.add_argument('--public', help='(server only) ip:port where we will listen for regular clients', type=str, default='0.0.0.0:8080', required=False)
 	parser.add_argument('--local', help='(client only) ip:port of the local target service', type=str, default="localhost:80", required=False)
 	parser.add_argument('--admin', help='ip:port tuple for admin/upstream/control connection', type=str, default="0.0.0.0:8081", required=False)
+	parser.add_argument('--timeout', help='tunnel socket send/recv timeout in seconds (0 = no timeout, default 1800)', type=int, default=1800, required=False)
 	args = parser.parse_args()
+	_tunnel_timeout = args.timeout
 	adminip, adminport = _parse_ip_port(args.admin)
 	if args.mode == 'server':
 		clientip, clientport = _parse_ip_port(args.public)
