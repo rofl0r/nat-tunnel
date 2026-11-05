@@ -299,7 +299,7 @@ static unsigned char g_server_sk[64];
 static int g_have_server_key;
 static unsigned char g_pinned_pk[32];
 static int g_have_pin;
-static int g_allow_cleartext = 1;
+static int g_allow_cleartext = 0; /* encrypted by default */
 
 static int load_server_key(const char *path) {
 	int fd = open(path, 0);
@@ -1030,17 +1030,22 @@ static void usage(const char *prog) {
 		"  --timeout SECS         tunnel socket timeout, default 1800, 0=none\n"
 		"  --help, -h             show this help\n"
 		"Server only:\n"
-		"  --public HOST:PORT     public listen address (default 0.0.0.0:8080)\n"
-		"  --admin HOST:PORT      admin listen address (default 0.0.0.0:8081)\n"
+		"  --public HOST:PORT     public listen address (required)\n"
+		"  --admin HOST:PORT      admin listen address (required)\n"
 		"  --server-key FILE      long term signing key (required, see --genkey)\n"
-		"  --allow-cleartext      accept cleartext tunnels (default)\n"
-		"  --no-cleartext         reject cleartext tunnels, sk2 only\n"
+		"  --allow-cleartext      allow unencrypted tunnel traffic.\n"
+		"                         By default tunnels are encrypted.\n"
+		"                         This can improve throughput, or\n"
+		"                         reduce overhead if the backend is\n"
+		"                         already encrypted, e.g. HTTPS.\n"
+		"                         Applies only to tunnel traffic,\n"
+		"                         control traffic stays encrypted.\n"
 		"Client only:\n"
 		"  --admin HOST:PORT      server admin address\n"
 		"  --local HOST:PORT      local service address (or unix path /path.sock)\n"
 		"  --server-pubkey HEX    pinned server public key (required)\n"
 		"Key generation (single option, role independent):\n"
-		"  %s --genkey --out FILE generate Ed25519 keypair to FILE (0600),\n"
+		"  %s --genkey FILE       generate Ed25519 keypair to FILE (0600),\n"
 		"                           print public key hex for pinning\n"
 		"Addresses: host:port, IPv6 as [::1]:8080, unix path as /tmp/x.sock\n"
 		"Keepalive: TCP probes every 30s idle (5s interval, 3 probes).\n",
@@ -1150,15 +1155,12 @@ static int parse_ip_port(const char *s, char *ip, size_t ip_cap, unsigned short 
 
 int main(int argc, char **argv) {
 	/* --genkey FILENAME is a standalone mode: generate a keypair
-	   and exit. Single option for both roles. The old
-	   --genkey --out FILE form still works. */
+	   and exit. Single option for both roles. */
 	if(argc >= 2 && strcmp(argv[1], "--genkey") == 0) {
 		const char *outpath = 0;
 		int i;
 		for(i=2;i<argc;i++) {
-			if(strcmp(argv[i], "--out") == 0 && i+1 < argc) outpath = argv[++i];
-			else if(strncmp(argv[i], "--out=", 6) == 0) outpath = argv[i]+6;
-			else if(outpath) { fprintf(stderr, "unrecognized argument: %s\n", argv[i]); return 1; }
+			if(outpath) { fprintf(stderr, "unrecognized argument: %s\n", argv[i]); return 1; }
 			else outpath = argv[i];
 		}
 		if(!outpath) { fprintf(stderr, "--genkey requires a filename: --genkey FILENAME\n"); return 1; }
@@ -1184,27 +1186,26 @@ int main(int argc, char **argv) {
 	int silent_argv = 0;
 	int i;
 	for(i=1;i<argc;i++) {
-		if(strcmp(argv[i], "--secret") == 0 && i+1 < argc) secret = argv[++i];
-		else if(strcmp(argv[i], "--mode") == 0 && i+1 < argc) mode = argv[++i];
-		else if(strcmp(argv[i], "--public") == 0 && i+1 < argc) public_addr = argv[++i];
-		else if(strcmp(argv[i], "--local") == 0 && i+1 < argc) local_addr = argv[++i];
-		else if(strcmp(argv[i], "--admin") == 0 && i+1 < argc) admin_addr = argv[++i];
-		else if(strcmp(argv[i], "--timeout") == 0 && i+1 < argc) timeout_s = argv[++i];
-		else if(strcmp(argv[i], "--secret-file") == 0 && i+1 < argc) secret_file = argv[++i];
-		else if(strcmp(argv[i], "--server-key") == 0 && i+1 < argc) server_key = argv[++i];
-		else if(strcmp(argv[i], "--server-pubkey") == 0 && i+1 < argc) server_pubkey = argv[++i];
+		if(strcmp(argv[i], "--secret") == 0 && i+1 < argc) secret = strdup(argv[++i]);
+		else if(strcmp(argv[i], "--mode") == 0 && i+1 < argc) mode = strdup(argv[++i]);
+		else if(strcmp(argv[i], "--public") == 0 && i+1 < argc) public_addr = strdup(argv[++i]);
+		else if(strcmp(argv[i], "--local") == 0 && i+1 < argc) local_addr = strdup(argv[++i]);
+		else if(strcmp(argv[i], "--admin") == 0 && i+1 < argc) admin_addr = strdup(argv[++i]);
+		else if(strcmp(argv[i], "--timeout") == 0 && i+1 < argc) timeout_s = strdup(argv[++i]);
+		else if(strcmp(argv[i], "--secret-file") == 0 && i+1 < argc) secret_file = strdup(argv[++i]);
+		else if(strcmp(argv[i], "--server-key") == 0 && i+1 < argc) server_key = strdup(argv[++i]);
+		else if(strcmp(argv[i], "--server-pubkey") == 0 && i+1 < argc) server_pubkey = strdup(argv[++i]);
 		else if(strcmp(argv[i], "--silent-argv") == 0) silent_argv = 1;
 		else if(strcmp(argv[i], "--allow-cleartext") == 0) allow_clear = 1;
-		else if(strcmp(argv[i], "--no-cleartext") == 0) allow_clear = 0;
-		else if(strncmp(argv[i], "--secret=", 9) == 0) secret = argv[i]+9;
-		else if(strncmp(argv[i], "--mode=", 7) == 0) mode = argv[i]+7;
-		else if(strncmp(argv[i], "--public=", 9) == 0) public_addr = argv[i]+9;
-		else if(strncmp(argv[i], "--local=", 8) == 0) local_addr = argv[i]+8;
-		else if(strncmp(argv[i], "--admin=", 8) == 0) admin_addr = argv[i]+8;
-		else if(strncmp(argv[i], "--timeout=", 10) == 0) timeout_s = argv[i]+10;
-		else if(strncmp(argv[i], "--secret-file=", 14) == 0) secret_file = argv[i]+14;
-		else if(strncmp(argv[i], "--server-key=", 13) == 0) server_key = argv[i]+13;
-		else if(strncmp(argv[i], "--server-pubkey=", 16) == 0) server_pubkey = argv[i]+16;
+		else if(strncmp(argv[i], "--secret=", 9) == 0) secret = strdup(argv[i]+9);
+		else if(strncmp(argv[i], "--mode=", 7) == 0) mode = strdup(argv[i]+7);
+		else if(strncmp(argv[i], "--public=", 9) == 0) public_addr = strdup(argv[i]+9);
+		else if(strncmp(argv[i], "--local=", 8) == 0) local_addr = strdup(argv[i]+8);
+		else if(strncmp(argv[i], "--admin=", 8) == 0) admin_addr = strdup(argv[i]+8);
+		else if(strncmp(argv[i], "--timeout=", 10) == 0) timeout_s = strdup(argv[i]+10);
+		else if(strncmp(argv[i], "--secret-file=", 14) == 0) secret_file = strdup(argv[i]+14);
+		else if(strncmp(argv[i], "--server-key=", 13) == 0) server_key = strdup(argv[i]+13);
+		else if(strncmp(argv[i], "--server-pubkey=", 16) == 0) server_pubkey = strdup(argv[i]+16);
 		else {
 			fprintf(stderr, "unrecognized argument: %s\n", argv[i]);
 			return 1;
@@ -1233,60 +1234,23 @@ int main(int argc, char **argv) {
 	}
 	if(secret_file) {
 		if(read_secret_file(secret_file) < 0) return 1;
-	} else if(g_secret) {
-		/* already copied from argv above */
 	} else {
+		/* secret is a strdup() copy from parsing; keep it for
+		   process lifetime. Shell history and the exec race
+		   window remain for --secret; prefer --secret-file. */
 		g_secret = secret;
 		g_secret_len = strlen(secret);
-		/* Best effort: zero the argv copy so a later ps dump
-		   (after exec race window) sees zeros. Shell history
-		   and the exec race window remain; prefer
-		   --secret-file on shared boxes. */
-		{
-			size_t j;
-			for(j=0;j<g_secret_len;j++) ((char*)secret)[j] = 0;
-		}
-	}
-	/* Copy secret out of argv first: --silent-argv zeroes argv[]
-	   afterwards, so pointers into argv must not be used after. */
-	if(secret) {
-		size_t n = strlen(secret);
-		if(n >= sizeof g_secret_buf) { fprintf(stderr, "secret too long\n"); return 1; }
-		memcpy(g_secret_buf, secret, n+1);
-		g_secret = g_secret_buf;
-		g_secret_len = n;
-		secret = 0;
 	}
 	if(silent_argv) {
 		/* Clear all argv strings for stealth (ps aux). Note:
 		   the kernel already exposed them at exec time; this
 		   only helps against later inspection, not the race
 		   window. Prefer --secret-file and --server-key.
-		   All options used after this point have been copied
-		   to static storage above (secret) or must be copied
-		   here before zeroing. Copy remaining pointers now. */
-		static char bufs[8][512];
-		int nb = 0;
-		const char **slots[8] = { &mode, &public_addr, &local_addr,
-			&admin_addr, &timeout_s, &server_key, &server_pubkey, 0 };
-		int k;
-		for(k=0; slots[k] && nb < 8; k++) {
-			const char *v = *slots[k];
-			if(v) {
-				size_t n = strlen(v);
-				if(n >= sizeof bufs[nb]) n = sizeof bufs[nb]-1;
-				memcpy(bufs[nb], v, n);
-				bufs[nb][n] = 0;
-				*slots[k] = bufs[nb];
-				nb++;
-			}
-		}
-		{
-			int j;
-			for(j=1;j<argc;j++) {
-				size_t n = strlen(argv[j]);
-				memset(argv[j], 0, n);
-			}
+		   Options were strdup()ed during parsing, so argv[]
+		   can be cleared safely now. argv[0] is kept. */
+		for(i=1;i<argc;i++) {
+			size_t n = strlen(argv[i]);
+			memset(argv[i], 0, n);
 		}
 	}
 	if(allow_clear >= 0) g_allow_cleartext = allow_clear;

@@ -54,7 +54,7 @@ Keys
 ----
 Generate the server signing key once:
 
-    ./natsrv --genkey --out server.key
+    ./natsrv --genkey server.key
 
 This writes the private key with 0600 permissions and prints
 the public key hex. Give that hex string to the client as
@@ -154,8 +154,11 @@ ephemeral private key, and the ephemeral exchange gives
 forward secrecy. Stream keys derive from the shared secret
 plus transcript hash. CONN peer addresses are always
 encrypted on the control channel, even when the server
-allows cleartext tunnels. Server policy via --allow-cleartext
-(default) or --no-cleartext controls whether skt is accepted.
+allows unencrypted tunnel traffic. By default tunnels are
+encrypted. The option can improve throughput, or reduce
+overhead if the backend is already encrypted, e.g. HTTPS.
+It applies only to tunnel traffic; control traffic stays
+encrypted.
 Capability byte bit 0 mirrors that setting on the wire.
 
 Keys: the server signing key is generated with --genkey
