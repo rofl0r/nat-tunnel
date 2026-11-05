@@ -13,6 +13,8 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/time.h>
 #include <arpa/inet.h>
 #ifdef HAVE_GETRANDOM
 #include <sys/random.h>
@@ -32,6 +34,51 @@
 
 static const char *g_secret;
 static size_t g_secret_len;
+static long g_timeout = 1800; /* seconds, 0 = no timeout */
+
+/* Keepalive only (30s idle, 5s interval, 3 probes). Never set
+   the tunnel recv/send timeout on the control socket: its
+   recv_line must block indefinitely while idle. */
+static void opt_sock(int fd) {
+	int yes = 1;
+	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof yes);
+	int idle = 30, intvl = 5, cnt = 3;
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
+}
+
+static void tunnel_sock(int fd) {
+	opt_sock(fd);
+	if(g_timeout > 0) {
+		struct timeval tv;
+		tv.tv_sec = g_timeout;
+		tv.tv_usec = 0;
+		setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+	}
+}
+
+/* Zero timeout poll: dead iff ERR/HUP/NVAL, or POLLIN with a
+   zero-length peek (FIN). Plain POLLIN with data is NOT death:
+   the server pairs the spare before sending CONN, so tunnel
+   data can legitimately be in flight when this runs. */
+static int spare_alive(int fd) {
+	struct pollfd pfd;
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+	int r;
+	do { r = poll(&pfd, 1, 0); } while(r < 0 && errno == EINTR);
+	if(r <= 0) return 1;
+	if(pfd.revents & (POLLERR|POLLHUP|POLLNVAL)) return 0;
+	if(pfd.revents & POLLIN) {
+		char c;
+		ssize_t n = recv(fd, &c, 1, MSG_PEEK|MSG_DONTWAIT);
+		if(n == 0) return 0;
+	}
+	return 1;
+}
 
 static void print_timestamp(void) {
 	time_t t = time(NULL);
@@ -437,6 +484,8 @@ static int tunnel_start(struct tunnel **slot, int fds, int fdc, int enc, const c
 	t->fdc = fdc;
 	t->done = 0;
 	t->enc = enc;
+	tunnel_sock(fds);
+	tunnel_sock(fdc);
 	if(enc) {
 		ctr_init(&t->enc_up, "enc-up", nonce);
 		ctr_init(&t->enc_dn, "enc-dn", nonce);
@@ -517,6 +566,7 @@ static int client_setup_sock(const char *upstream_ip, unsigned short upstream_po
 		close(fd);
 		return -1;
 	}
+	opt_sock(fd);
 	if(nonce_out) strcpy(nonce_out, linebuf);
 	return fd;
 }
@@ -584,6 +634,13 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 				next = client_setup_sock(upstream_ip, upstream_port, "sk2", next_nonce);
 				continue;
 			}
+			if(!spare_alive(next)) {
+				printf("spare socket dead, re-arming\n");
+				fflush(stdout);
+				close(next);
+				next = client_setup_sock(upstream_ip, upstream_port, "sk2", next_nonce);
+				continue;
+			}
 			if(tunnel_add(&threads, &nthreads, &capthreads, local, next, 1, next_nonce) < 0) {
 				close(local); close(next);
 				continue;
@@ -637,6 +694,7 @@ static int server_wait_conn_up(int su, int *control, int *next_up, int *next_enc
 	char expect[HASH_HEX_LEN+1];
 	compute_hash("adm", nonce, expect);
 	if(cl == HASH_HEX_LEN && ct_equal(cmdbuf, expect, HASH_HEX_LEN)) {
+		opt_sock(conn);
 		if(*control >= 0) close(*control);
 		/* Orphan spare (matches py fix): old code left the
 		   spare from the dead admin session in place. */
@@ -649,6 +707,7 @@ static int server_wait_conn_up(int su, int *control, int *next_up, int *next_enc
 		compute_hash("sk2", nonce, expect);
 		int is_sk2 = cl == HASH_HEX_LEN && ct_equal(cmdbuf, expect, HASH_HEX_LEN);
 		if(is_skt || is_sk2) {
+			opt_sock(conn);
 			printf("OK (tunnel%s)\n", is_sk2 ? " enc" : "");
 			if(*control < 0) close(conn);
 			else {
@@ -708,6 +767,13 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 				continue;
 			}
 			if(fds[0].revents & POLLIN) {
+				if(!spare_alive(next_up)) {
+					printf("lost spare upstream socket\n");
+					fflush(stdout);
+					close(next_up);
+					next_up = -1;
+					continue;
+				}
 				union sockaddr_union addr;
 				socklen_t alen = sizeof addr;
 				int conn = accept(sc, (struct sockaddr*)&addr, &alen);
@@ -778,7 +844,11 @@ static void usage(const char *prog) {
 		"Server (IPv6):\n"
 		"    %s --mode server --secret s3cretP4ss --public [::]:7000 --admin [::]:8000\n"
 		"Client (IPv6 upstream):\n"
-		"    %s --mode client --secret s3cretP4ss --local localhost:80 --admin [2001:db8::1]:8000\n",
+		"    %s --mode client --secret s3cretP4ss --local localhost:80 --admin [2001:db8::1]:8000\n"
+		"\n"
+		"--timeout SECS: tunnel socket send/recv timeout in seconds\n"
+		"(0 = no timeout, default 1800). TCP keepalive probes every\n"
+		"30s idle (5s interval, 3 probes) on all sockets.\n",
 		prog, prog, prog, prog);
 }
 
@@ -830,6 +900,7 @@ int main(int argc, char **argv) {
 	const char *public_addr = "0.0.0.0:8080";
 	const char *local_addr = "localhost:80";
 	const char *admin_addr = "0.0.0.0:8081";
+	const char *timeout_s = 0;
 	int i;
 	for(i=1;i<argc;i++) {
 		if(strcmp(argv[i], "--secret") == 0 && i+1 < argc) secret = argv[++i];
@@ -837,11 +908,13 @@ int main(int argc, char **argv) {
 		else if(strcmp(argv[i], "--public") == 0 && i+1 < argc) public_addr = argv[++i];
 		else if(strcmp(argv[i], "--local") == 0 && i+1 < argc) local_addr = argv[++i];
 		else if(strcmp(argv[i], "--admin") == 0 && i+1 < argc) admin_addr = argv[++i];
+		else if(strcmp(argv[i], "--timeout") == 0 && i+1 < argc) timeout_s = argv[++i];
 		else if(strncmp(argv[i], "--secret=", 9) == 0) secret = argv[i]+9;
 		else if(strncmp(argv[i], "--mode=", 7) == 0) mode = argv[i]+7;
 		else if(strncmp(argv[i], "--public=", 9) == 0) public_addr = argv[i]+9;
 		else if(strncmp(argv[i], "--local=", 8) == 0) local_addr = argv[i]+8;
 		else if(strncmp(argv[i], "--admin=", 8) == 0) admin_addr = argv[i]+8;
+		else if(strncmp(argv[i], "--timeout=", 10) == 0) timeout_s = argv[i]+10;
 		else {
 			fprintf(stderr, "unrecognized argument: %s\n", argv[i]);
 			return 1;
@@ -850,6 +923,15 @@ int main(int argc, char **argv) {
 	if(!secret || !mode) {
 		fprintf(stderr, "--secret and --mode are required\n");
 		return 1;
+	}
+	if(timeout_s) {
+		char *end = 0;
+		long v = strtol(timeout_s, &end, 10);
+		if(!end || *end || end == timeout_s || v < 0) {
+			fprintf(stderr, "bad --timeout value: %s\n", timeout_s);
+			return 1;
+		}
+		g_timeout = v;
 	}
 	g_secret = secret;
 	g_secret_len = strlen(secret);
