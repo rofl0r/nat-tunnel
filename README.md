@@ -1,5 +1,14 @@
-NAT Tunnel v0.01
-----------------
+NAT Tunnel v0.01 (nt02)
+-----------------------
+
+NOTE: The current C version speaks wire protocol nt02, a binary
+length prefixed protocol with X25519 ephemeral keys, Ed25519
+server authentication, and XSalsa20 tunnel encryption. The old
+Python version (natsrv.py) is final and unmaintained. It speaks
+the pre-nt02 text protocol and is incompatible with the C
+version. Python instructions are collected at the end of this
+file for reference.
+
 If you have access to a server with public IP and unfiltered ports
 you can run NAT Tunnel (NT)  server on the server, and NT client
 on your box behind NAT.
@@ -25,21 +34,6 @@ You want to make it available on your cloud server/VPS/etc's public
 IP on port 7000.
 We use port 8000 on the cloud server for the control channel.
 
-Server (IPv4):
-
-    natsrv.py --mode server --secret s3cretP4ss --public 0.0.0.0:7000 --admin 0.0.0.0:8000
-
-Client (IPv4):
-
-    natsrv.py --mode client --secret s3cretP4ss --local localhost:80 --admin example.com:8000
-
-Server (IPv6, note the brackets):
-
-    natsrv.py --mode server --secret s3cretP4ss --public [::]:7000 --admin [::]:8000
-
-Client (IPv6 upstream, IPv4 local):
-
-    natsrv.py --mode client --secret s3cretP4ss --local localhost:80 --admin [2001:db8::1]:8000
 Python version status
 -------------------
 The Python version (natsrv.py plus rocksock.py) is final and
@@ -218,4 +212,23 @@ IPv4 all interfaces, :: means IPv6 all interfaces.
 On the wire the server reports a peer as ip:port for IPv4 and
 [ip]:port for IPv6, and both sides parse both forms.
 
+Legacy Python version (final, pre-nt02)
+--------------------------------------
+The text below is the old Python-only documentation. It does
+not describe the nt02 C wire protocol.
 
+Server (IPv4):
+
+    natsrv.py --mode server --secret s3cretP4ss --public 0.0.0.0:7000 --admin 0.0.0.0:8000
+
+Client (IPv4):
+
+    natsrv.py --mode client --secret s3cretP4ss --local localhost:80 --admin example.com:8000
+
+Server (IPv6, note the brackets):
+
+    natsrv.py --mode server --secret s3cretP4ss --public [::]:7000 --admin [::]:8000
+
+Client (IPv6 upstream, IPv4 local):
+
+    natsrv.py --mode client --secret s3cretP4ss --local localhost:80 --admin [2001:db8::1]:8000

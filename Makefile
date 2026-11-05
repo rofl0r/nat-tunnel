@@ -19,6 +19,7 @@ all: $(PROG)
 clean:
 	rm -f $(PROG)
 	rm -f $(OBJS)
+	rm -f tweetnacl.o
 
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<

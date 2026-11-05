@@ -172,18 +172,16 @@ struct ctr_stream {
 	size_t leftover_len;
 };
 
+#ifndef USE_SODIUM
 static const unsigned char g_sigma[16] = "expand 32-byte k";
 static void salsa_block(struct ctr_stream *st) {
-#ifndef USE_SODIUM
 	unsigned char z[16];
 	int i;
 	memcpy(z, st->nonce + 16, 8);
 	for(i=0;i<8;i++) z[8+i] = (unsigned char)(st->block_counter >> (8*i));
 	NCRYPT_CORE_SALSA(st->leftover, z, st->subkey, g_sigma);
-#else
-	(void)st;
-#endif
 }
+#endif
 static void ctr_init_ex(struct ctr_stream *st, const unsigned char *key, const unsigned char *nonce24) {
 	memcpy(st->key, key, 32);
 	memcpy(st->nonce, nonce24, 24);
@@ -333,10 +331,16 @@ static int load_server_key(const char *path) {
 }
 
 static void x25519_base(unsigned char *out, const unsigned char *sk) {
-	NCRYPT_SCALARMULT_BASE(out, sk);
+	if(NCRYPT_SCALARMULT_BASE(out, sk) != 0) {
+		fprintf(stderr, "crypto_scalarmult_base failed\n");
+		exit(1);
+	}
 }
 static void x25519_mul(unsigned char *out, const unsigned char *sk, const unsigned char *pk) {
-	NCRYPT_SCALARMULT(out, sk, pk);
+	if(NCRYPT_SCALARMULT(out, sk, pk) != 0) {
+		fprintf(stderr, "crypto_scalarmult failed (bad peer key)\n");
+		exit(1);
+	}
 }
 static unsigned char g_sign_buf[128];
 static int ed_sign(unsigned char *sig, const unsigned char *msg, size_t len) {
@@ -716,7 +720,7 @@ static int client_setup_sock(const char *upstream_ip, unsigned short upstream_po
 	}
 	/* our ephemeral */
 	unsigned char eph_sk[32], eph_c[32];
-	randombytes(eph_sk, 32);
+	rng_fill(eph_sk, 32);
 	x25519_base(eph_c, eph_sk);
 	unsigned char shared[32], thash[32], mac[32];
 	x25519_mul(shared, eph_sk, eph_s);
@@ -840,10 +844,10 @@ static int server_wait_conn_up(int su, int *control, int *next_up, int *next_enc
 	format_addr(&addr, addrstr, sizeof addrstr);
 	/* SERVER_HELLO: MAGIC + eph_pk + cap + nonce(16) + sig(64) = 117 */
 	unsigned char eph_sk[32], eph_pk[32];
-	randombytes(eph_sk, 32);
+	rng_fill(eph_sk, 32);
 	x25519_base(eph_pk, eph_sk);
 	unsigned char nonce[16];
-	randombytes(nonce, 16);
+	rng_fill(nonce, 16);
 	unsigned char cap = g_allow_cleartext ? 1 : 0;
 	unsigned char sh[117];
 	memcpy(sh, NT_MAGIC, 4);
