@@ -119,6 +119,25 @@ Control traffic (adm handshake, CONN: notifications, public
 client addresses) is always cleartext. Use a strong secret and,
 if you need integrity or forward secrecy, run the tunnel over
 TLS or another authenticated encrypted transport.
+Timeouts and keepalive
+----------------------
+Tunnel sockets have send and receive timeouts, set with
+--timeout SECS (default 1800, 0 disables them). The default is
+deliberately conservative: a slow server such as llama.cpp
+below 10 tokens per second, or a huge system prompt upload,
+can legitimately block for many minutes. Shorter values kill
+such tunnels; longer values delay dead socket detection.
+Control sockets never get the timeout, so an idle control
+connection is not killed.
+
+All sockets use TCP keepalive with probes every 30 seconds
+of idle time (5 second interval, 3 probes), so a silently
+dead peer is detected in about 45 seconds instead of the
+2 hour default. Before a spare socket is paired, both ends
+poll it with a zero timeout: a socket that already shows
+FIN or RST is dropped and re-armed instead of hanging the
+next tunnel. Readable data alone is not treated as death,
+since tunnel bytes can legitimately be in flight.
 
 IPv6 and addresses
 -------------------
