@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -475,6 +476,20 @@ static struct addrinfo *pick_best(struct addrinfo *ai) {
 }
 
 static int connect_to(const char *host, unsigned short port) {
+	/* Unix socket path for --local: host is a pathname starting
+	   with '/'. Port is ignored. Lets microsocks (also unix)
+	   chain without any open TCP ports on the natted box. */
+	if(host[0] == '/') {
+		int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+		if(fd < 0) return -1;
+		struct sockaddr_un addr;
+		memset(&addr, 0, sizeof addr);
+		addr.sun_family = AF_UNIX;
+		if(strlen(host) >= sizeof addr.sun_path) { close(fd); return -1; }
+		strcpy(addr.sun_path, host);
+		if(connect(fd, (struct sockaddr*)&addr, sizeof addr) < 0) { close(fd); return -1; }
+		return fd;
+	}
 	struct addrinfo *ai = 0;
 	if(resolve_any(host, port, 0, &ai) < 0) return -1;
 	/* Try every result in turn (v4 first via pick order is not
@@ -1122,6 +1137,13 @@ static int parse_ip_port(const char *s, char *ip, size_t ip_cap, unsigned short 
 	   also reject it). */
 	const char *colon;
 	size_t n;
+	if(s[0] == '/') {
+		/* Unix socket path: no port; whole string is the path. */
+		if(strlen(s) >= ip_cap) return -1;
+		strcpy(ip, s);
+		*port = 0;
+		return 0;
+	}
 	if(s[0] == '[') {
 		const char *rb = strchr(s, ']');
 		if(!rb || rb[1] != ':') return -1;
