@@ -24,6 +24,11 @@
 #define NONCE_HEX_LEN (NONCE_LEN*2)
 #define HASH_HEX_LEN (SHA256_DIGEST_SIZE*2)
 #define BUFSZ 1024
+/* Fixed per-thread stack size, ported from microsocks. The
+   microsocks ifdeffery (PTHREAD_STACK_MIN, per-OS overrides)
+   is dropped: 64KB is enough for the tunnel thread on any
+   OS, whose biggest stack user is getaddrinfo in libc. */
+#define THREAD_STACK_SIZE (64*1024)
 
 static const char *g_secret;
 static size_t g_secret_len;
@@ -368,7 +373,17 @@ static int tunnel_start(struct tunnel **slot, int fds, int fdc) {
 	t->fds = fds;
 	t->fdc = fdc;
 	t->done = 0;
-	if(pthread_create(&t->pt, 0, tunnel_thread, t) != 0) {
+	/* Ported from microsocks sockssrv.c: pthread_attr with a
+	   fixed stack size. If attr init fails we fall back to
+	   the default attr, same as microsocks. */
+	pthread_attr_t *a = 0, attr;
+	if(pthread_attr_init(&attr) == 0) {
+		a = &attr;
+		pthread_attr_setstacksize(a, THREAD_STACK_SIZE);
+	}
+	int rc = pthread_create(&t->pt, a, tunnel_thread, t);
+	if(a) pthread_attr_destroy(&attr);
+	if(rc != 0) {
 		free(t);
 		return -1;
 	}
