@@ -34,6 +34,8 @@
 
 static const char *g_secret;
 static size_t g_secret_len;
+static char g_secret_buf[4096];
+static int g_secret_from_file;
 static long g_timeout = 1800; /* seconds, 0 = no timeout */
 
 /* Keepalive only (30s idle, 5s interval, 3 probes). Never set
@@ -179,20 +181,38 @@ static int ct_equal(const char *a, const char *b, size_t n) {
    "enc-up" or "enc-dn" (32 bytes). Nonce24 is derived as
    sha256("enc-nonce" + secret + nonce) truncated to 24
    bytes. Directions never share a key stream. */
-#include "tweetnacl.h"
-#ifndef USE_SODIUM
-/* TweetNaCl keypair functions reference randombytes(), but the
-   stream code we use does not. Provide a fail-closed stub so
-   linking tweetnacl.c succeeds without a full RNG backend. */
-#include <stdlib.h>
-void randombytes(unsigned char *x, unsigned long long n) {
-	(void)x; (void)n;
-	fprintf(stderr, "randombytes: not available\n");
-	exit(1);
-}
-#endif
 #ifdef USE_SODIUM
 #include <sodium.h>
+#else
+#include "tweetnacl.h"
+#endif
+#ifndef USE_SODIUM
+/* TweetNaCl keypair functions need randombytes(). Implement it
+   from /dev/urandom (or getrandom with HAVE_GETRANDOM) so
+   crypto_sign_keypair and crypto_scalarmult_base work. */
+#include <stdlib.h>
+#include <fcntl.h>
+void randombytes(unsigned char *x, unsigned long long n) {
+	unsigned long long got = 0;
+#ifdef HAVE_GETRANDOM
+	while(got < n) {
+		ssize_t r = getrandom(x+got, n-got, 0);
+		if(r < 0) { if(errno == EINTR) continue; perror("getrandom"); exit(1); }
+		if(r == 0) break;
+		got += (unsigned long long)r;
+	}
+	if(got != n) { fprintf(stderr, "getrandom short read\n"); exit(1); }
+#else
+	int fd = open("/dev/urandom", 0);
+	if(fd < 0) { perror("open /dev/urandom"); exit(1); }
+	while(got < n) {
+		ssize_t r = read(fd, x+got, n-got);
+		if(r <= 0) { perror("read /dev/urandom"); exit(1); }
+		got += (unsigned long long)r;
+	}
+	close(fd);
+#endif
+}
 #endif
 struct ctr_stream {
 	unsigned char key[32];
@@ -890,10 +910,73 @@ static void usage(const char *prog) {
 		"Client (IPv6 upstream):\n"
 		"    %s --mode client --secret s3cretP4ss --local localhost:80 --admin [2001:db8::1]:8000\n"
 		"\n"
+		"For shared boxes prefer --secret-file PATH (0600 file) over\n"
+		"--secret, which leaks via ps aux. Key generation (single\n"
+		"option for both roles, role independent):\n"
+		"    %s --genkey --out server.key\n"
+		"\n"
 		"--timeout SECS: tunnel socket send/recv timeout in seconds\n"
 		"(0 = no timeout, default 1800). TCP keepalive probes every\n"
 		"30s idle (5s interval, 3 probes) on all sockets.\n",
-		prog, prog, prog, prog);
+		prog, prog, prog, prog, prog);
+}
+
+static int read_secret_file(const char *path) {
+	int fd = open(path, 0);
+	if(fd < 0) { perror(path); return -1; }
+	ssize_t n = read(fd, g_secret_buf, sizeof g_secret_buf - 1);
+	close(fd);
+	if(n <= 0) { fprintf(stderr, "empty secret file: %s\n", path); return -1; }
+	if(n == (ssize_t)(sizeof g_secret_buf - 1)) { fprintf(stderr, "secret file too long: %s\n", path); return -1; }
+	g_secret_buf[n] = 0;
+	/* strip one trailing newline/CRLF like a text file */
+	while(n > 0 && (g_secret_buf[n-1] == '\n' || g_secret_buf[n-1] == '\r')) g_secret_buf[--n] = 0;
+	if(n == 0) { fprintf(stderr, "empty secret in file: %s\n", path); return -1; }
+	g_secret = g_secret_buf;
+	g_secret_len = (size_t)n;
+	g_secret_from_file = 1;
+	return 0;
+}
+
+static int hex_parse(const char *hex, unsigned char *out, size_t outlen) {
+	size_t i;
+	if(strlen(hex) != outlen * 2) return -1;
+	for(i=0;i<outlen;i++) {
+		unsigned int v;
+		if(sscanf(hex + 2*i, "%2x", &v) != 1) return -1;
+		out[i] = (unsigned char)v;
+	}
+	return 0;
+}
+
+static int do_genkey(const char *outpath) {
+	unsigned char pk[32], sk[64];
+#ifdef USE_SODIUM
+	if(crypto_sign_keypair(pk, sk) != 0) { fprintf(stderr, "crypto_sign_keypair failed\n"); return 1; }
+#else
+	crypto_sign_ed25519_tweet_keypair(pk, sk);
+#endif
+	int fd = open(outpath, 1|64|512, 0600);
+	if(fd < 0) { perror(outpath); return 1; }
+	/* file format: hex pk + newline + hex sk + newline, for pinning */
+	char buf[200];
+	int m = snprintf(buf, sizeof buf, "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+		pk[0],pk[1],pk[2],pk[3],pk[4],pk[5],pk[6],pk[7],pk[8],pk[9],pk[10],pk[11],pk[12],pk[13],pk[14],pk[15],pk[16],pk[17],pk[18],pk[19],pk[20],pk[21],pk[22],pk[23],pk[24],pk[25],pk[26],pk[27],pk[28],pk[29],pk[30],pk[31]);
+	if(m <= 0 || write(fd, buf, (size_t)m) != m) { perror("write key"); return 1; }
+	if(write(fd, sk, 64) != 64) { perror("write key"); return 1; }
+	if(write(fd, "\n", 1) != 1) { perror("write key"); return 1; }
+	close(fd);
+	{
+		char hexpk[65];
+		int i;
+		for(i=0;i<32;i++) snprintf(hexpk+2*i, 3, "%02x", pk[i]);
+		hexpk[64] = 0;
+		printf("public key: %s\n", hexpk);
+		printf("private key written to %s (0600)\n", outpath);
+		printf("pin the public key on the peer with the matching hex string\n");
+	}
+	memset(sk, 0, sizeof sk);
+	return 0;
 }
 
 static int parse_ip_port(const char *s, char *ip, size_t ip_cap, unsigned short *port) {
@@ -932,6 +1015,20 @@ static int parse_ip_port(const char *s, char *ip, size_t ip_cap, unsigned short 
 }
 
 int main(int argc, char **argv) {
+	/* --genkey is a standalone mode: generate a keypair and exit.
+	   Single option for both roles, since Ed25519 generation
+	   is role independent. */
+	if(argc >= 2 && strcmp(argv[1], "--genkey") == 0) {
+		const char *outpath = 0;
+		int i;
+		for(i=2;i<argc;i++) {
+			if(strcmp(argv[i], "--out") == 0 && i+1 < argc) outpath = argv[++i];
+			else if(strncmp(argv[i], "--out=", 6) == 0) outpath = argv[i]+6;
+			else { fprintf(stderr, "unrecognized argument: %s\n", argv[i]); return 1; }
+		}
+		if(!outpath) { fprintf(stderr, "--genkey requires --out FILE\n"); return 1; }
+		return do_genkey(outpath);
+	}
 	if(argc < 2 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
 		usage(argv[0]);
 		if(argc < 2) return 1;
@@ -945,6 +1042,7 @@ int main(int argc, char **argv) {
 	const char *local_addr = "localhost:80";
 	const char *admin_addr = "0.0.0.0:8081";
 	const char *timeout_s = 0;
+	const char *secret_file = 0;
 	int i;
 	for(i=1;i<argc;i++) {
 		if(strcmp(argv[i], "--secret") == 0 && i+1 < argc) secret = argv[++i];
@@ -953,19 +1051,25 @@ int main(int argc, char **argv) {
 		else if(strcmp(argv[i], "--local") == 0 && i+1 < argc) local_addr = argv[++i];
 		else if(strcmp(argv[i], "--admin") == 0 && i+1 < argc) admin_addr = argv[++i];
 		else if(strcmp(argv[i], "--timeout") == 0 && i+1 < argc) timeout_s = argv[++i];
+		else if(strcmp(argv[i], "--secret-file") == 0 && i+1 < argc) secret_file = argv[++i];
 		else if(strncmp(argv[i], "--secret=", 9) == 0) secret = argv[i]+9;
 		else if(strncmp(argv[i], "--mode=", 7) == 0) mode = argv[i]+7;
 		else if(strncmp(argv[i], "--public=", 9) == 0) public_addr = argv[i]+9;
 		else if(strncmp(argv[i], "--local=", 8) == 0) local_addr = argv[i]+8;
 		else if(strncmp(argv[i], "--admin=", 8) == 0) admin_addr = argv[i]+8;
 		else if(strncmp(argv[i], "--timeout=", 10) == 0) timeout_s = argv[i]+10;
+		else if(strncmp(argv[i], "--secret-file=", 14) == 0) secret_file = argv[i]+14;
 		else {
 			fprintf(stderr, "unrecognized argument: %s\n", argv[i]);
 			return 1;
 		}
 	}
-	if(!secret || !mode) {
-		fprintf(stderr, "--secret and --mode are required\n");
+	if(secret && secret_file) {
+		fprintf(stderr, "--secret and --secret-file are mutually exclusive\n");
+		return 1;
+	}
+	if((!secret && !secret_file) || !mode) {
+		fprintf(stderr, "--secret or --secret-file, and --mode, are required\n");
 		return 1;
 	}
 	if(timeout_s) {
@@ -977,8 +1081,20 @@ int main(int argc, char **argv) {
 		}
 		g_timeout = v;
 	}
-	g_secret = secret;
-	g_secret_len = strlen(secret);
+	if(secret_file) {
+		if(read_secret_file(secret_file) < 0) return 1;
+	} else {
+		g_secret = secret;
+		g_secret_len = strlen(secret);
+		/* Best effort: zero the argv copy so a later ps dump
+		   (after exec race window) sees zeros. Shell history
+		   and the exec race window remain; prefer
+		   --secret-file on shared boxes. */
+		{
+			size_t j;
+			for(j=0;j<g_secret_len;j++) ((char*)secret)[j] = 0;
+		}
+	}
 	signal(SIGPIPE, SIG_IGN);
 	char admin_ip[256];
 	unsigned short admin_port;
