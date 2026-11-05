@@ -22,6 +22,19 @@ def _hash(str):
 # so split(b':') cannot tell address from port. Use a pre-compiled
 # regex and strip the brackets on parse; _format_addr adds them.
 _CONN_RE = re.compile(br'CONN:\[(?P<ip>[^\]]+)\]:(?P<port>\d+)\b|CONN:(?P<ip4>\d{1,3}(?:\.\d{1,3}){3}):(?P<port4>\d+)\b')
+_CLI_RE = re.compile(r'^\[(?P<ip6>[^\]\s]+)\]:(?P<port6>\d+)$|^(?P<ip>[^:\s\[\]]+):(?P<port>\d+)$')
+def _parse_ip_port(s):
+	# CLI "host:port" where host may be [v6]. Bare v6 without
+	# brackets is ambiguous (more than one colon) and rejected.
+	m = _CLI_RE.match(s)
+	if not m:
+		raise ValueError('bad ip:port address: %r (use [v6]:port for IPv6)' % s)
+	if m.group('ip') is not None:
+		return m.group('ip'), int(m.group('port'))
+	if not m.group('ip6'):
+		raise ValueError('bad ip:port address: %r (use [v6]:port for IPv6)' % s)
+	return m.group('ip6'), int(m.group('port6'))
+
 def _parse_conn(line):
 	# Return (ip_str, port_int) or None. Line is bytes without newline.
 	m = _CONN_RE.search(line)
@@ -400,14 +413,14 @@ if __name__ == "__main__":
 	parser.add_argument('--local', help='(client only) ip:port of the local target service', type=str, default="localhost:80", required=False)
 	parser.add_argument('--admin', help='ip:port tuple for admin/upstream/control connection', type=str, default="0.0.0.0:8081", required=False)
 	args = parser.parse_args()
-	adminip, adminport = args.admin.split(':')
+	adminip, adminport = _parse_ip_port(args.admin)
 	if args.mode == 'server':
-		clientip, clientport = args.public.split(':')
-		srv = NATSrv(_b(args.secret, 'utf-8'), adminip, int(adminport), clientip, int(clientport))
+		clientip, clientport = _parse_ip_port(args.public)
+		srv = NATSrv(_b(args.secret, 'utf-8'), adminip, adminport, clientip, clientport)
 		srv.setup()
 		srv.doit()
 	else:
-		localip, localport = args.local.split(':')
-		cl = NATClient(_b(args.secret, 'utf-8'), adminip, int(adminport), localip, int(localport))
+		localip, localport = _parse_ip_port(args.local)
+		cl = NATClient(_b(args.secret, 'utf-8'), adminip, adminport, localip, localport)
 		cl.setup()
 		cl.doit()
