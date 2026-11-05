@@ -75,9 +75,9 @@ no weaker fallback. Linkage is just -lpthread; the code itself is
 C99 and portable with no GNU99 extensions. Tabs are used for
 indentation, following the microsocks code style.
 
-Security note: see "Wire protocol and encryption" below. The
-control handshake is authenticated with the shared secret, but
-no traffic is encrypted.
+Security note: see "Wire protocol and encryption" below.
+Tunnel payloads use sk2 encryption by default; control
+traffic is authenticated only and stays cleartext.
 
 Wire protocol and encryption
 ----------------------------
