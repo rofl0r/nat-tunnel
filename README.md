@@ -78,6 +78,26 @@ indentation, following the microsocks code style.
 Security note: see "Wire protocol and encryption" below.
 Tunnel payloads use sk2 encryption by default; control
 traffic is authenticated only and stays cleartext.
+SHA-NI acceleration (optional)
+------------------------------
+On x86 with Intel SHA extensions, sha256.c uses the SHA-NI
+intrinsics automatically when the compiler defines __SHA__
+and __SSSE3__. The scalar implementation remains the fallback.
+Enable it without -march=native by adding the two flags that
+define the macro and the intrinsics:
+
+    make CPPFLAGS="-msha -msse4.1"
+
+That builds a binary that needs any x86 CPU with SHA-NI and
+SSE4.1 support, without other -march=native features. Plain
+make without those flags still works everywhere.
+
+Measured on an i7-1160G7, raw SHA256 of 16 KiB blocks:
+scalar -O2 is about 257 MB/s, SHA-NI -O2 is about
+1574 MB/s (about 6 times faster). For sk2 key stream
+generation the gain is smaller because each 32 byte block
+pays context setup cost: about 98 MB/s scalar versus
+about 223 MB/s with SHA-NI.
 
 Wire protocol and encryption
 ----------------------------
