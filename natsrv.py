@@ -86,11 +86,15 @@ def _tunnel_sock(sock):
 	return sock
 
 def _spare_alive(sock):
-	# Zero timeout poll: readable spare means FIN/RST/stray data,
-	# i.e. dead for our purposes. Unreadable means still alive.
+	# Zero timeout poll: dead iff select shows it readable AND a
+	# MSG_PEEK recv returns b'' (FIN). Readable with data is NOT
+	# death: the server pairs the spare before sending CONN, so
+	# tunnel data can legitimately be in flight when this runs.
 	try:
 		r, _, _ = select.select([sock], [], [], 0)
-		return not r
+		if not r:
+			return True
+		return sock.recv(1, socket.MSG_PEEK) != b''
 	except (ValueError, OSError):
 		return False
 
