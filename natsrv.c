@@ -123,6 +123,60 @@ static int ct_equal(const char *a, const char *b, size_t n) {
 	return diff == 0;
 }
 
+/* sk2 stream cipher: SHA256 in counter mode, per tunnel, per
+   direction. Mirrors the Python _CtrStream / _enc_keys exactly:
+   key = sha256(label + secret + nonce), label "enc-up" or
+   "enc-dn"; block i = sha256(key + be64(i)); data XOR keystream.
+   State (counter + leftover) is continuous across chunks. */
+struct ctr_stream {
+	unsigned char key[SHA256_DIGEST_SIZE];
+	unsigned long long counter;
+	unsigned char leftover[SHA256_DIGEST_SIZE];
+	size_t leftover_len;
+};
+
+static void ctr_init(struct ctr_stream *st, const char *label, const char *nonce) {
+	sha256_ctx ctx;
+	sha256_init(&ctx);
+	sha256_update(&ctx, (const unsigned char*)label, strlen(label));
+	sha256_update(&ctx, (const unsigned char*)g_secret, g_secret_len);
+	sha256_update(&ctx, (const unsigned char*)nonce, strlen(nonce));
+	sha256_final(&ctx, st->key);
+	st->counter = 0;
+	st->leftover_len = 0;
+}
+
+static void ctr_crypt(struct ctr_stream *st, unsigned char *data, size_t n) {
+	size_t pos = 0;
+	while(pos < n) {
+		if(st->leftover_len == 0) {
+			unsigned char ctrbe[8];
+			unsigned long long c = st->counter++;
+			int i;
+			for(i=0;i<8;i++) ctrbe[i] = (unsigned char)(c >> (56 - 8*i));
+			sha256_ctx ctx;
+			sha256_init(&ctx);
+			sha256_update(&ctx, st->key, SHA256_DIGEST_SIZE);
+			sha256_update(&ctx, ctrbe, 8);
+			sha256_final(&ctx, st->leftover);
+			st->leftover_len = SHA256_DIGEST_SIZE;
+		}
+		if(st->leftover_len < n - pos) {
+			size_t i;
+			for(i=0;i<st->leftover_len;i++) data[pos+i] ^= st->leftover[i];
+			pos += st->leftover_len;
+			st->leftover_len = 0;
+		} else {
+			size_t take = n - pos;
+			size_t i;
+			for(i=0;i<take;i++) data[pos+i] ^= st->leftover[i];
+			memmove(st->leftover, st->leftover+take, st->leftover_len-take);
+			st->leftover_len -= take;
+			pos += take;
+		}
+	}
+}
+
 static int send_all(int fd, const void *buf, size_t len) {
 	const char *p = buf;
 	size_t sent = 0;
@@ -301,6 +355,9 @@ struct tunnel {
 	int fdc;
 	pthread_t pt;
 	volatile int done;
+	int enc; /* 0 = cleartext skt, 1 = encrypted sk2 */
+	struct ctr_stream enc_up; /* fds -> fdc */
+	struct ctr_stream enc_dn; /* fdc -> fds */
 };
 
 /* Tunnel threads are heap allocated and the list stores pointers to
@@ -345,6 +402,12 @@ static void *tunnel_thread(void *data) {
 			shutdown(outfd, SHUT_WR);
 			continue;
 		}
+		if(t->enc) {
+			/* Same direction mapping as Python: enc_up is
+			   fds->fdc, enc_dn is fdc->fds on both ends. */
+			if(infd == t->fds) ctr_crypt(&t->enc_up, (unsigned char*)buf, (size_t)n);
+			else ctr_crypt(&t->enc_dn, (unsigned char*)buf, (size_t)n);
+		}
 		size_t sent = 0;
 		int failed = 0;
 		while(sent < (size_t)n) {
@@ -367,12 +430,17 @@ static void *tunnel_thread(void *data) {
 	return 0;
 }
 
-static int tunnel_start(struct tunnel **slot, int fds, int fdc) {
+static int tunnel_start(struct tunnel **slot, int fds, int fdc, int enc, const char *nonce) {
 	struct tunnel *t = malloc(sizeof *t);
 	if(!t) return -1;
 	t->fds = fds;
 	t->fdc = fdc;
 	t->done = 0;
+	t->enc = enc;
+	if(enc) {
+		ctr_init(&t->enc_up, "enc-up", nonce);
+		ctr_init(&t->enc_dn, "enc-dn", nonce);
+	}
 	/* Ported from microsocks sockssrv.c: pthread_attr with a
 	   fixed stack size. If attr init fails we fall back to
 	   the default attr, same as microsocks. */
@@ -404,7 +472,7 @@ static void tunnel_reap(struct tunnel ***arr, size_t *count) {
 	}
 }
 
-static int tunnel_add(struct tunnel ***arr, size_t *count, size_t *cap, int fds, int fdc) {
+static int tunnel_add(struct tunnel ***arr, size_t *count, size_t *cap, int fds, int fdc, int enc, const char *nonce) {
 	if(*count == *cap) {
 		size_t ncap = *cap ? *cap * 2 : 8;
 		struct tunnel **nt = realloc(*arr, ncap * sizeof *nt);
@@ -412,14 +480,14 @@ static int tunnel_add(struct tunnel ***arr, size_t *count, size_t *cap, int fds,
 		*arr = nt;
 		*cap = ncap;
 	}
-	if(tunnel_start(&(*arr)[*count], fds, fdc) != 0) return -1;
+	if(tunnel_start(&(*arr)[*count], fds, fdc, enc, nonce) != 0) return -1;
 	(*count)++;
 	return 0;
 }
 
 /* ---- NAT client ---- */
 
-static int client_setup_sock(const char *upstream_ip, unsigned short upstream_port, const char *cmd) {
+static int client_setup_sock(const char *upstream_ip, unsigned short upstream_port, const char *cmd, char *nonce_out) {
 	int fd = connect_to(upstream_ip, upstream_port);
 	if(fd < 0) {
 		perror("connect upstream");
@@ -449,13 +517,15 @@ static int client_setup_sock(const char *upstream_ip, unsigned short upstream_po
 		close(fd);
 		return -1;
 	}
+	if(nonce_out) strcpy(nonce_out, linebuf);
 	return fd;
 }
 
 static void client_doit(const char *upstream_ip, unsigned short upstream_port, const char *local_ip, unsigned short local_port) {
-	int control = client_setup_sock(upstream_ip, upstream_port, "adm");
+	char next_nonce[NONCE_HEX_LEN+1];
+	int control = client_setup_sock(upstream_ip, upstream_port, "adm", 0);
 	if(control < 0) return;
-	int next = client_setup_sock(upstream_ip, upstream_port, "skt");
+	int next = client_setup_sock(upstream_ip, upstream_port, "sk2", next_nonce);
 	if(next < 0) { close(control); return; }
 	struct tunnel **threads = 0;
 	size_t nthreads = 0, capthreads = 0;
@@ -478,9 +548,9 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 				ts.tv_sec = 2;
 				ts.tv_nsec = 0;
 				nanosleep(&ts, 0);
-				control = client_setup_sock(upstream_ip, upstream_port, "adm");
+				control = client_setup_sock(upstream_ip, upstream_port, "adm", 0);
 				if(control < 0) continue;
-				next = client_setup_sock(upstream_ip, upstream_port, "skt");
+				next = client_setup_sock(upstream_ip, upstream_port, "sk2", next_nonce);
 				if(next < 0) { close(control); control = -1; }
 			}
 			continue;
@@ -511,14 +581,14 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 				   that the server had paired with it. Drop the
 				   spare, arm a fresh one, and continue. */
 				if(next >= 0) close(next);
-				next = client_setup_sock(upstream_ip, upstream_port, "skt");
+				next = client_setup_sock(upstream_ip, upstream_port, "sk2", next_nonce);
 				continue;
 			}
-			if(tunnel_add(&threads, &nthreads, &capthreads, local, next) < 0) {
+			if(tunnel_add(&threads, &nthreads, &capthreads, local, next, 1, next_nonce) < 0) {
 				close(local); close(next);
 				continue;
 			}
-			next = client_setup_sock(upstream_ip, upstream_port, "skt");
+			next = client_setup_sock(upstream_ip, upstream_port, "sk2", next_nonce);
 			if(next < 0) break;
 		}
 	}
@@ -526,7 +596,7 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 
 /* ---- NAT server ---- */
 
-static int server_wait_conn_up(int su, int *control, int *next_up) {
+static int server_wait_conn_up(int su, int *control, int *next_up, int *next_enc, char *next_nonce) {
 	union sockaddr_union addr;
 	socklen_t alen = sizeof addr;
 	int conn = accept(su, (struct sockaddr*)&addr, &alen);
@@ -575,12 +645,17 @@ static int server_wait_conn_up(int su, int *control, int *next_up) {
 		printf("OK (admin)\n");
 	} else {
 		compute_hash("skt", nonce, expect);
-		if(cl == HASH_HEX_LEN && ct_equal(cmdbuf, expect, HASH_HEX_LEN)) {
-			printf("OK (tunnel)\n");
+		int is_skt = cl == HASH_HEX_LEN && ct_equal(cmdbuf, expect, HASH_HEX_LEN);
+		compute_hash("sk2", nonce, expect);
+		int is_sk2 = cl == HASH_HEX_LEN && ct_equal(cmdbuf, expect, HASH_HEX_LEN);
+		if(is_skt || is_sk2) {
+			printf("OK (tunnel%s)\n", is_sk2 ? " enc" : "");
 			if(*control < 0) close(conn);
 			else {
 				if(*next_up >= 0) close(*next_up);
 				*next_up = conn;
+				*next_enc = is_sk2;
+				if(next_nonce) strcpy(next_nonce, nonce);
 			}
 		} else {
 			printf("rejected!\n");
@@ -598,12 +673,14 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 	if(sc < 0) { perror("listen public"); return; }
 	int control = -1;
 	int next_up = -1;
+	int next_enc = 0;
+	char next_nonce_srv[NONCE_HEX_LEN+1];
 	struct tunnel **threads = 0;
 	size_t nthreads = 0, capthreads = 0;
 	while(1) {
 		tunnel_reap(&threads, &nthreads);
-		if(control < 0) server_wait_conn_up(su, &control, &next_up);
-		if(next_up < 0) server_wait_conn_up(su, &control, &next_up);
+		if(control < 0) server_wait_conn_up(su, &control, &next_up, &next_enc, next_nonce_srv);
+		if(next_up < 0) server_wait_conn_up(su, &control, &next_up, &next_enc, next_nonce_srv);
 		if(control >= 0 && next_up >= 0) {
 			struct pollfd fds[3];
 			fds[0].fd = sc; fds[0].events = POLLIN; fds[0].revents = 0;
@@ -644,7 +721,7 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 					close(conn);
 					continue;
 				}
-				if(tunnel_add(&threads, &nthreads, &capthreads, next_up, conn) < 0) {
+				if(tunnel_add(&threads, &nthreads, &capthreads, next_up, conn, next_enc, next_nonce_srv) < 0) {
 					close(next_up); close(conn);
 					next_up = -1;
 					continue;
