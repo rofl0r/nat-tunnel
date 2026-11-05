@@ -169,16 +169,16 @@ not describe the nt02 C wire protocol.
 
 Server (IPv4):
 
-    natsrv.py --mode server --secret s3cretP4ss --public 0.0.0.0:7000 --admin 0.0.0.0:8000
+    natsrv.py --mode server --secret s3cretP4ss --public 0.0.0.0:8000 --admin 0.0.0.0:7000
 
 Client (IPv4):
 
-    natsrv.py --mode client --secret s3cretP4ss --local localhost:80 --admin example.com:8000
+    natsrv.py --mode client --secret s3cretP4ss --local localhost:80 --admin example.com:7000
 
 Server (IPv6, note the brackets):
 
-    natsrv.py --mode server --secret s3cretP4ss --public [::]:7000 --admin [::]:8000
+    natsrv.py --mode server --secret s3cretP4ss --public [::]:8000 --admin [::]:7000
 
 Client (IPv6 upstream, IPv4 local):
 
-    natsrv.py --mode client --secret s3cretP4ss --local localhost:80 --admin [2001:db8::1]:8000
+    natsrv.py --mode client --secret s3cretP4ss --local localhost:80 --admin [2001:db8::1]:7000
