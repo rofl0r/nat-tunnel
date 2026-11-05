@@ -92,74 +92,29 @@ static void print_timestamp(void) {
 	fflush(stdout);
 }
 
-static const char hexd[] = "0123456789abcdef";
-
-static void hex_encode(const unsigned char *in, size_t n, char *out) {
-	size_t i;
-	for(i=0;i<n;i++) {
-		out[2*i] = hexd[(in[i]>>4)&15];
-		out[2*i+1] = hexd[in[i]&15];
-	}
-	out[2*n] = 0;
-}
-
-static void get_nonce(char out[NONCE_HEX_LEN+1]) {
-	unsigned char raw[NONCE_LEN];
-
+/* Single RNG entry point for the whole file. get_nonce() for
+   legacy hex nonces and randombytes() for TweetNaCl keypair
+   generation both call this. Fail closed, no weak fallback. */
+static void rng_fill(unsigned char *buf, size_t n) {
+	size_t got = 0;
 #ifdef HAVE_GETRANDOM
-	/* getrandom() syscall via libc (Linux 3.17+ / glibc 2.25+).
-	   Enable with: make CPPFLAGS=-DHAVE_GETRANDOM */
-	{
-		ssize_t r;
-		size_t got = 0;
-		while(got < NONCE_LEN) {
-			r = getrandom(raw+got, NONCE_LEN-got, 0);
-			if(r < 0) {
-				if(errno == EINTR) continue;
-				perror("getrandom");
-				exit(1);
-			}
-			if(r == 0) break;
-			got += (size_t)r;
-		}
-		if(got != NONCE_LEN) {
-			perror("getrandom");
-			exit(1);
-		}
+	while(got < n) {
+		ssize_t r = getrandom(buf+got, n-got, 0);
+		if(r < 0) { if(errno == EINTR) continue; perror("getrandom"); exit(1); }
+		if(r == 0) break;
+		got += (size_t)r;
 	}
+	if(got != n) { fprintf(stderr, "getrandom short read\n"); exit(1); }
 #else
 	int fd = open("/dev/urandom", 0);
-	if(fd >= 0) {
-		size_t got = 0;
-		while(got < NONCE_LEN) {
-			ssize_t r = read(fd, raw+got, NONCE_LEN-got);
-			if(r <= 0) break;
-			got += (size_t)r;
-		}
-		close(fd);
-		if(got != NONCE_LEN) {
-			/* No fallback: rand() seeded with time+pid is
-			   predictable and not secure. Fail closed. */
-			perror("read /dev/urandom");
-			exit(1);
-		}
-	} else {
-		perror("open /dev/urandom");
-		exit(1);
+	if(fd < 0) { perror("open /dev/urandom"); exit(1); }
+	while(got < n) {
+		ssize_t r = read(fd, buf+got, n-got);
+		if(r <= 0) { perror("read /dev/urandom"); exit(1); }
+		got += (size_t)r;
 	}
+	close(fd);
 #endif
-	hex_encode(raw, NONCE_LEN, out);
-}
-
-static void compute_hash(const char *cmd, const char *nonce, char out[HASH_HEX_LEN+1]) {
-	sha256_ctx ctx;
-	unsigned char digest[SHA256_DIGEST_SIZE];
-	sha256_init(&ctx);
-	sha256_update(&ctx, (const unsigned char*)cmd, strlen(cmd));
-	sha256_update(&ctx, (const unsigned char*)g_secret, g_secret_len);
-	sha256_update(&ctx, (const unsigned char*)nonce, strlen(nonce));
-	sha256_final(&ctx, digest);
-	hex_encode(digest, SHA256_DIGEST_SIZE, out);
 }
 
 /* Constant-time compare (matches py hmac.compare_digest fix).
@@ -183,8 +138,20 @@ static int ct_equal(const char *a, const char *b, size_t n) {
    bytes. Directions never share a key stream. */
 #ifdef USE_SODIUM
 #include <sodium.h>
+#define NCRYPT_SCALARMULT_BASE crypto_scalarmult_base
+#define NCRYPT_SCALARMULT crypto_scalarmult
+#define NCRYPT_SIGN crypto_sign
+#define NCRYPT_SIGN_OPEN crypto_sign_open
+#define NCRYPT_SIGN_KEYPAIR crypto_sign_keypair
 #else
 #include "tweetnacl.h"
+#define NCRYPT_SCALARMULT_BASE crypto_scalarmult_curve25519_tweet_base
+#define NCRYPT_SCALARMULT crypto_scalarmult_curve25519_tweet
+#define NCRYPT_SIGN crypto_sign_ed25519_tweet
+#define NCRYPT_SIGN_OPEN crypto_sign_ed25519_tweet_open
+#define NCRYPT_SIGN_KEYPAIR crypto_sign_ed25519_tweet_keypair
+#define NCRYPT_CORE_SALSA crypto_core_salsa20_tweet
+#define NCRYPT_CORE_HSALSA crypto_core_hsalsa20_tweet
 #endif
 #ifndef USE_SODIUM
 /* TweetNaCl keypair functions need randombytes(). Implement it
@@ -193,25 +160,7 @@ static int ct_equal(const char *a, const char *b, size_t n) {
 #include <stdlib.h>
 #include <fcntl.h>
 void randombytes(unsigned char *x, unsigned long long n) {
-	unsigned long long got = 0;
-#ifdef HAVE_GETRANDOM
-	while(got < n) {
-		ssize_t r = getrandom(x+got, n-got, 0);
-		if(r < 0) { if(errno == EINTR) continue; perror("getrandom"); exit(1); }
-		if(r == 0) break;
-		got += (unsigned long long)r;
-	}
-	if(got != n) { fprintf(stderr, "getrandom short read\n"); exit(1); }
-#else
-	int fd = open("/dev/urandom", 0);
-	if(fd < 0) { perror("open /dev/urandom"); exit(1); }
-	while(got < n) {
-		ssize_t r = read(fd, x+got, n-got);
-		if(r <= 0) { perror("read /dev/urandom"); exit(1); }
-		got += (unsigned long long)r;
-	}
-	close(fd);
-#endif
+	rng_fill(x, (size_t)n);
 }
 #endif
 struct ctr_stream {
@@ -223,44 +172,27 @@ struct ctr_stream {
 	size_t leftover_len;
 };
 
-static void derive_key(const char *label, const char *nonce, unsigned char out[32]) {
-	sha256_ctx ctx;
-	sha256_init(&ctx);
-	sha256_update(&ctx, (const unsigned char*)label, strlen(label));
-	sha256_update(&ctx, (const unsigned char*)g_secret, g_secret_len);
-	sha256_update(&ctx, (const unsigned char*)nonce, strlen(nonce));
-	sha256_final(&ctx, out);
+static const unsigned char g_sigma[16] = "expand 32-byte k";
+static void salsa_block(struct ctr_stream *st) {
+#ifndef USE_SODIUM
+	unsigned char z[16];
+	int i;
+	memcpy(z, st->nonce + 16, 8);
+	for(i=0;i<8;i++) z[8+i] = (unsigned char)(st->block_counter >> (8*i));
+	NCRYPT_CORE_SALSA(st->leftover, z, st->subkey, g_sigma);
+#else
+	(void)st;
+#endif
 }
-
 static void ctr_init_ex(struct ctr_stream *st, const unsigned char *key, const unsigned char *nonce24) {
 	memcpy(st->key, key, 32);
 	memcpy(st->nonce, nonce24, 24);
 #ifndef USE_SODIUM
-	{
-		unsigned char sigma_[16];
-		memcpy(sigma_, "expand 32-byte k", 16);
-		crypto_core_hsalsa20(st->subkey, st->nonce, st->key, sigma_);
-	}
+	NCRYPT_CORE_HSALSA(st->subkey, st->nonce, st->key, g_sigma);
 #endif
 	st->block_counter = 0;
 	st->leftover_len = 0;
 }
-static void ctr_init(struct ctr_stream *st, const char *label, const char *nonce) {
-	unsigned char n24full[32];
-	derive_key(label, nonce, st->key);
-	derive_key("enc-nonce", nonce, n24full);
-	memcpy(st->nonce, n24full, 24);
-#ifndef USE_SODIUM
-	{
-		unsigned char sigma_[16];
-		memcpy(sigma_, "expand 32-byte k", 16);
-		crypto_core_hsalsa20(st->subkey, st->nonce, st->key, sigma_);
-	}
-#endif
-	st->block_counter = 0;
-	st->leftover_len = 0;
-}
-
 static void ctr_crypt(struct ctr_stream *st, unsigned char *data, size_t n) {
 	size_t pos = 0;
 	while(pos < n) {
@@ -272,19 +204,7 @@ static void ctr_crypt(struct ctr_stream *st, unsigned char *data, size_t n) {
 				crypto_stream_xsalsa20_xor_ic(st->leftover, zeros, 64, st->nonce, st->block_counter, st->key);
 			}
 #else
-			{
-				unsigned char sigma_[16];
-				unsigned char z[16];
-				memcpy(sigma_, "expand 32-byte k", 16);
-				memcpy(z, st->nonce + 16, 8);
-				memset(z + 8, 0, 8);
-				{
-					unsigned long long c = st->block_counter;
-					int i;
-					for(i=0;i<8;i++) z[8+i] = (unsigned char)(c >> (8*i));
-				}
-				crypto_core_salsa20(st->leftover, z, st->subkey, sigma_);
-			}
+			salsa_block(st);
 #endif
 			st->leftover_len = 64;
 			st->block_counter++;
@@ -328,24 +248,6 @@ static int recv_exact(int fd, void *buf, size_t len) {
 		if(n == 0) return -1;
 		got += (size_t)n;
 	}
-	return 0;
-}
-
-static int recv_line(int fd, char *buf, size_t cap, size_t *out_len) {
-	size_t n = 0;
-	while(n + 1 < cap) {
-		char c;
-		ssize_t r = recv(fd, &c, 1, 0);
-		if(r < 0) {
-			if(errno == EINTR) continue;
-			return -1;
-		}
-		if(r == 0) return -1;
-		buf[n++] = c;
-		if(c == '\n') break;
-	}
-	buf[n] = 0;
-	if(out_len) *out_len = n;
 	return 0;
 }
 
@@ -432,27 +334,22 @@ static int load_server_key(const char *path) {
 
 static void x25519_base(unsigned char *out, const unsigned char *sk) {
 #ifdef USE_SODIUM
-	crypto_scalarmult_base(out, sk);
+	NCRYPT_SCALARMULT_BASE(out, sk);
 #else
-	crypto_scalarmult_curve25519_tweet_base(out, sk);
+	NCRYPT_SCALARMULT_BASE(out, sk);
 #endif
 }
 static void x25519_mul(unsigned char *out, const unsigned char *sk, const unsigned char *pk) {
 #ifdef USE_SODIUM
-	crypto_scalarmult(out, sk, pk);
+	NCRYPT_SCALARMULT(out, sk, pk);
 #else
-	crypto_scalarmult_curve25519_tweet(out, sk, pk);
+	NCRYPT_SCALARMULT(out, sk, pk);
 #endif
 }
 static unsigned char g_sign_buf[128];
 static int ed_sign(unsigned char *sig, const unsigned char *msg, size_t len) {
 	unsigned long long slen = 0;
-	int r;
-#ifdef USE_SODIUM
-	r = crypto_sign(g_sign_buf, &slen, msg, len, g_server_sk);
-#else
-	r = crypto_sign_ed25519_tweet(g_sign_buf, &slen, msg, len, g_server_sk);
-#endif
+	int r = NCRYPT_SIGN(g_sign_buf, &slen, msg, len, g_server_sk);
 	if(r) return r;
 	memcpy(sig, g_sign_buf, 64);
 	return 0;
@@ -467,11 +364,7 @@ static int ed_verify(const unsigned char *sig, const unsigned char *msg, size_t 
 	int r;
 	memcpy(sm, sig, 64);
 	memcpy(sm + 64, msg, len);
-#ifdef USE_SODIUM
-	r = crypto_sign_open(outmsg, &mlen, sm, 64 + len, g_pinned_pk);
-#else
-	r = crypto_sign_ed25519_tweet_open(outmsg, &mlen, sm, 64 + len, g_pinned_pk);
-#endif
+	r = NCRYPT_SIGN_OPEN(outmsg, &mlen, sm, 64 + len, g_pinned_pk);
 	return r;
 }
 
@@ -653,7 +546,6 @@ struct tunnel {
 	pthread_t pt;
 	volatile int done;
 	int enc; /* 0 = cleartext skt, 1 = encrypted sk2 */
-	int framed_fd; /* nt02 spare fd carrying frames, -1 = raw */
 	struct ctr_stream enc_up; /* fds -> fdc */
 	struct ctr_stream enc_dn; /* fdc -> fds */
 };
@@ -689,30 +581,14 @@ static void *tunnel_thread(void *data) {
 			continue;
 		}
 		char buf[BUFSZ];
-		unsigned char ftype;
-		unsigned char fbuf[BUFSZ];
-		size_t flen = 0;
 		ssize_t n;
-		if(infd == t->framed_fd) {
-			/* framed spare side: expect FT_TUNNEL frames */
-			if(recv_frame(infd, &ftype, fbuf, BUFSZ, &flen) < 0) {
-				if(infd == t->fds) open0 = 0;
-				else open1 = 0;
-				shutdown(outfd, SHUT_WR);
-				continue;
-			}
-			if(ftype == FT_CLOSE) {
-				if(infd == t->fds) open0 = 0;
-				else open1 = 0;
-				shutdown(outfd, SHUT_WR);
-				continue;
-			}
-			if(ftype != FT_TUNNEL) break;
-			n = (ssize_t)flen;
-			memcpy(buf, fbuf, flen);
-		} else {
-			n = recv(infd, buf, sizeof buf, 0);
-		}
+		/* Tunnel channel is a raw byte stream: the cipher is
+		   continuous across chunks, so no per-chunk framing
+		   is needed. One recv plus one send per chunk.
+		   Close is signalled by TCP FIN via the half-close
+		   shutdown below. Framing is kept only on the
+		   control channel (CONN lines need parsing). */
+		n = recv(infd, buf, sizeof buf, 0);
 		if(n < 0) {
 			if(errno == EINTR) continue;
 			n = 0;
@@ -727,9 +603,7 @@ static void *tunnel_thread(void *data) {
 			if(infd == t->fds) ctr_crypt(&t->enc_up, (unsigned char*)buf, (size_t)n);
 			else ctr_crypt(&t->enc_dn, (unsigned char*)buf, (size_t)n);
 		}
-		if(outfd == t->framed_fd) {
-			if(send_frame(outfd, FT_TUNNEL, buf, (size_t)n) < 0) break;
-		} else {
+		{
 			size_t sent = 0;
 			int failed = 0;
 			while(sent < (size_t)n) {
@@ -756,14 +630,13 @@ static void *tunnel_thread(void *data) {
 static unsigned char g_tun_up[32], g_tun_dn[32], g_tun_n24[32];
 static struct ctr_stream g_ctl_up, g_ctl_dn; /* control channel streams */
 static int g_ctl_valid;
-static int tunnel_start(struct tunnel **slot, int fds, int fdc, int enc, int framed_fd) {
+static int tunnel_start(struct tunnel **slot, int fds, int fdc, int enc) {
 	struct tunnel *t = malloc(sizeof *t);
 	if(!t) return -1;
 	t->fds = fds;
 	t->fdc = fdc;
 	t->done = 0;
 	t->enc = enc;
-	t->framed_fd = framed_fd;
 	tunnel_sock(fds);
 	tunnel_sock(fdc);
 	if(enc) {
@@ -801,7 +674,7 @@ static void tunnel_reap(struct tunnel ***arr, size_t *count) {
 	}
 }
 
-static int tunnel_add(struct tunnel ***arr, size_t *count, size_t *cap, int fds, int fdc, int enc, int framed_fd) {
+static int tunnel_add(struct tunnel ***arr, size_t *count, size_t *cap, int fds, int fdc, int enc) {
 	if(*count == *cap) {
 		size_t ncap = *cap ? *cap * 2 : 8;
 		struct tunnel **nt = realloc(*arr, ncap * sizeof *nt);
@@ -809,7 +682,7 @@ static int tunnel_add(struct tunnel ***arr, size_t *count, size_t *cap, int fds,
 		*arr = nt;
 		*cap = ncap;
 	}
-	if(tunnel_start(&(*arr)[*count], fds, fdc, enc, framed_fd) != 0) return -1;
+	if(tunnel_start(&(*arr)[*count], fds, fdc, enc) != 0) return -1;
 	(*count)++;
 	return 0;
 }
@@ -824,24 +697,6 @@ static void ctl_init_from(const unsigned char *shared, const unsigned char *thas
 static void tun_init_from(const unsigned char *shared, const unsigned char *thash) {
 	stream_keys(shared, thash, g_tun_up, g_tun_dn, g_tun_n24);
 }
-/* nt02 handshake: returns fd + fills req_out, framed_fd is fd itself on return.
-   req_out: 0 adm, 1 skt, 2 sk2. Side effect: sets g_ctl_* for adm,
-   g_tun_* for spare (via tun_init_from). */
-static int nt02_handshake(int fd, unsigned char req, int *enc_out) {
-	unsigned char eph_sk[32], eph_pk[32];
-	randombytes(eph_sk, 32);
-	x25519_base(eph_pk, eph_sk);
-	unsigned char nonce[16];
-	randombytes(nonce, 16);
-	unsigned char shared[32], thash[32], mac[32];
-	if(req == 0) {
-		/* server side adm is handled in server_wait_conn_up_new;
-		   this helper is client side only */
-	}
-	(void)fd; (void)req; (void)enc_out; (void)eph_pk; (void)shared; (void)thash; (void)mac;
-	return 0;
-}
-
 /* ---- NAT client ---- */
 
 static int client_setup_sock(const char *upstream_ip, unsigned short upstream_port, unsigned char req) {
@@ -965,7 +820,7 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 				next = client_setup_sock(upstream_ip, upstream_port, 2);
 				continue;
 			}
-			if(tunnel_add(&threads, &nthreads, &capthreads, local, next, 1, next) < 0) {
+			if(tunnel_add(&threads, &nthreads, &capthreads, local, next, 1) < 0) {
 				close(local); close(next);
 				continue;
 			}
@@ -1068,13 +923,12 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 	int control = -1;
 	int next_up = -1;
 	int next_enc = 0;
-	char next_nonce_srv[NONCE_HEX_LEN+1];
 	struct tunnel **threads = 0;
 	size_t nthreads = 0, capthreads = 0;
 	while(1) {
 		tunnel_reap(&threads, &nthreads);
-		if(control < 0) server_wait_conn_up(su, &control, &next_up, &next_enc, next_nonce_srv);
-		if(next_up < 0) server_wait_conn_up(su, &control, &next_up, &next_enc, next_nonce_srv);
+		if(control < 0) server_wait_conn_up(su, &control, &next_up, &next_enc, 0);
+		if(next_up < 0) server_wait_conn_up(su, &control, &next_up, &next_enc, 0);
 		if(control >= 0 && next_up >= 0) {
 			struct pollfd fds[3];
 			fds[0].fd = sc; fds[0].events = POLLIN; fds[0].revents = 0;
@@ -1124,7 +978,7 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 					close(conn);
 					continue;
 				}
-				if(tunnel_add(&threads, &nthreads, &capthreads, next_up, conn, next_enc, next_up) < 0) {
+				if(tunnel_add(&threads, &nthreads, &capthreads, next_up, conn, next_enc) < 0) {
 					close(next_up); close(conn);
 					next_up = -1;
 					continue;
@@ -1208,7 +1062,7 @@ static void usage(const char *prog) {
 		"--timeout SECS: tunnel socket send/recv timeout in seconds\n"
 		"(0 = no timeout, default 1800). TCP keepalive probes every\n"
 		"30s idle (5s interval, 3 probes) on all sockets.\n",
-		prog, prog, prog, prog, prog, prog);
+		prog, prog, prog, prog, prog);
 }
 
 static int read_secret_file(const char *path) {
@@ -1242,9 +1096,9 @@ static int hex_parse(const char *hex, unsigned char *out, size_t outlen) {
 static int do_genkey(const char *outpath) {
 	unsigned char pk[32], sk[64];
 #ifdef USE_SODIUM
-	if(crypto_sign_keypair(pk, sk) != 0) { fprintf(stderr, "crypto_sign_keypair failed\n"); return 1; }
+	if(NCRYPT_SIGN_KEYPAIR(pk, sk) != 0) { fprintf(stderr, "crypto_sign_keypair failed\n"); return 1; }
 #else
-	crypto_sign_ed25519_tweet_keypair(pk, sk);
+	NCRYPT_SIGN_KEYPAIR(pk, sk);
 #endif
 	int fd = open(outpath, 1|64|512, 0600);
 	if(fd < 0) { perror(outpath); return 1; }
