@@ -399,11 +399,25 @@ if __name__ == "__main__":
 		"IP on port 7000.\n"
 		"We use port 8000 on the cloud server for the control channel.\n"
 		"\n"
-		"Server:\n"
+		"Server (IPv4):\n"
 		"    %s --mode server --secret s3cretP4ss --public 0.0.0.0:7000 --admin 0.0.0.0:8000\n"
-		"Client:\n"
+		"Client (IPv4):\n"
 		"    %s --mode client --secret s3cretP4ss --local localhost:80 --admin example.com:8000\n"
-	) % (sys.argv[0], sys.argv[0])
+		"\n"
+		"IPv6 and addresses:\n"
+		"IPv4 and IPv6 both work. Use host:port, with brackets for\n"
+		"IPv6 literals: [::1]:8080, [2001:db8::1]:7000. A bare IPv6\n"
+		"address without brackets is rejected (ambiguous port).\n"
+		"Host names prefer IPv4 with IPv6 fallback; an explicit\n"
+		"numeric literal always wins for its family. Listen 0.0.0.0\n"
+		"means IPv4 all, :: means IPv6 all. Peers are reported as\n"
+		"ip:port for IPv4 and [ip]:port for IPv6.\n"
+		"\n"
+		"Server (IPv6):\n"
+		"    %s --mode server --secret s3cretP4ss --public [::]:7000 --admin [::]:8000\n"
+		"Client (IPv6 upstream):\n"
+		"    %s --mode client --secret s3cretP4ss --local localhost:80 --admin [2001:db8::1]:8000\n"
+	) % (sys.argv[0], sys.argv[0], sys.argv[0], sys.argv[0])
 	if len(sys.argv) < 2 or (sys.argv[1] == '-h' or sys.argv[1] == '--help'):
 		print(desc)
 	parser = argparse.ArgumentParser(description='')
