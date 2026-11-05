@@ -1247,10 +1247,18 @@ int main(int argc, char **argv) {
 		   only helps against later inspection, not the race
 		   window. Prefer --secret-file and --server-key.
 		   Options were strdup()ed during parsing, so argv[]
-		   can be cleared safely now. argv[0] is kept. */
+		   can be cleared safely now. */
 		for(i=1;i<argc;i++) {
 			size_t n = strlen(argv[i]);
 			memset(argv[i], 0, n);
+		}
+		if(argv[0][0] == '.' && argv[0][1] == '/') {
+			/* ./natsrv -> natsrv, so ps shows a bare name */
+			size_t n = strlen(argv[0]) - 2;
+			size_t k;
+			for(k=0;k<n;k++) argv[0][k] = argv[0][k+2];
+			argv[0][n] = 0;
+			argv[0][n+1] = 0;
 		}
 	}
 	if(allow_clear >= 0) g_allow_cleartext = allow_clear;
