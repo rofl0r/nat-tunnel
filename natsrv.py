@@ -168,7 +168,7 @@ class Tunnel():
 				continue
 			other = {self.fds: self.fdc, self.fdc: self.fds}[a[0]]
 			try:
-				buf = a[0].recv(1024)
+				buf = a[0].recv(16384)
 			except (ConnectionResetError, OSError):
 				buf = b''
 			if len(buf) == 0:

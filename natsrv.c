@@ -25,7 +25,7 @@
 #define NONCE_LEN 8
 #define NONCE_HEX_LEN (NONCE_LEN*2)
 #define HASH_HEX_LEN (SHA256_DIGEST_SIZE*2)
-#define BUFSZ 1024
+#define BUFSZ (16*1024)
 /* Fixed per-thread stack size, ported from microsocks. The
    microsocks ifdeffery (PTHREAD_STACK_MIN, per-OS overrides)
    is dropped: 64KB is enough for the tunnel thread on any
