@@ -890,14 +890,28 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 				}
 				continue;
 			}
-			if(fds[1].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) {
-				/* Readable or errored: the spare is unusable.
-				   RST it, so the server drops its side now. */
+			if(fds[1].revents & (POLLERR|POLLHUP|POLLNVAL)) {
+				/* Error: the spare is unusable. RST it, so the
+				   server drops its side at once. */
 				dolog("%sspare socket dead, re-arming\n", ts_prefix(tsbuf, sizeof tsbuf));
 				kill_sock(next);
 				next = client_setup_sock(upstream_ip, upstream_port, 2);
 				if(next < 0) goto lost_control;
 				continue;
+			}
+			if(fds[1].revents & POLLIN) {
+				/* Readable is not death: the server pairs the
+				   spare first and writes the CONN frame after, so
+				   tunnel bytes can be queued here already. Only a
+				   zero length peek means FIN. Anything else is
+				   left for the CONN frame below. */
+				if(!spare_alive(next)) {
+					dolog("%sspare socket dead, re-arming\n", ts_prefix(tsbuf, sizeof tsbuf));
+					kill_sock(next);
+					next = client_setup_sock(upstream_ip, upstream_port, 2);
+					if(next < 0) goto lost_control;
+					continue;
+				}
 			}
 			if(fds[0].revents & (POLLERR|POLLHUP|POLLNVAL)) goto lost_control;
 			if(!(fds[0].revents & POLLIN)) continue;

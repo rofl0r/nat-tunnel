@@ -145,6 +145,39 @@ reaches a tunnel. Readable data alone is not treated as
 death on a spare that is about to be paired, since tunnel
 bytes can legitimately be in flight.
 
+Tests
+-----
+Run the whole suite with:
+
+    make test
+
+This needs python3 and builds natsrv first. The suite starts
+real server and client processes on loopback ports. Each test
+gets its own ports, work dir and logs, so a failure never
+leaks into the next test.
+
+Tests can be selected by name, and listed:
+
+    python3 tests/natt.py --list
+    python3 tests/natt.py spare_rst control_rst
+
+Fault injection uses a TCP proxy in front of the admin port
+(tests/natt.py, class FaultProxy). Each accepted connection
+gets an id in accept order and a role read from its client
+hello, so the control socket and the spare socket are told
+apart. A test can drop one with RST, drop it with FIN, or
+freeze it, i.e. stop forwarding bytes while both sockets stay
+open. A freeze on the control socket models a silently dead
+path. The peer kernel keeps answering keepalive probes on
+loopback, so the control_blackhole test drops the packets
+with iptables instead. That test needs root and is skipped
+otherwise.
+
+Slow tests detect a blackhole through TCP keepalive, which
+takes about 45 seconds. They only run on request:
+
+    make test-slow
+
 Logging
 -------
 All console output goes to stderr, through one dprintf()
