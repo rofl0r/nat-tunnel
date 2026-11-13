@@ -19,7 +19,6 @@
 #include <arpa/inet.h>
 #ifdef HAVE_GETRANDOM
 #include <sys/random.h>
-#include <linux/random.h>
 #endif
 #include "sha256.h"
 
@@ -197,11 +196,6 @@ static int ct_equal(const char *a, const char *b, size_t n) {
 #define NCRYPT_CORE_HSALSA crypto_core_hsalsa20_tweet
 #endif
 #ifndef USE_SODIUM
-/* TweetNaCl keypair functions need randombytes(). Implement it
-   from /dev/urandom (or getrandom with HAVE_GETRANDOM) so
-   crypto_sign_keypair and crypto_scalarmult_base work. */
-#include <stdlib.h>
-#include <fcntl.h>
 void randombytes(unsigned char *x, unsigned long long n) {
 	rng_fill(x, (size_t)n);
 }
