@@ -23,9 +23,6 @@
 #endif
 #include "sha256.h"
 
-#define NONCE_LEN 8
-#define NONCE_HEX_LEN (NONCE_LEN*2)
-#define HASH_HEX_LEN (SHA256_DIGEST_SIZE*2)
 #define BUFSZ (16*1024)
 /* Fixed per-thread stack size, ported from microsocks. The
    microsocks ifdeffery (PTHREAD_STACK_MIN, per-OS overrides)
@@ -45,8 +42,17 @@
 static const char *g_secret;
 static size_t g_secret_len;
 static char g_secret_buf[4096];
-static int g_secret_from_file;
 static long g_timeout = 1800; /* seconds, 0 = no timeout */
+
+/* Set or clear SO_SNDTIMEO/SO_RCVTIMEO. secs 0 clears the
+   timeout, i.e. an infinite wait. */
+static void sock_timeout(int fd, int secs, int send, int recv_) {
+	struct timeval tv;
+	tv.tv_sec = secs;
+	tv.tv_usec = 0;
+	if(send) setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+	if(recv_) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+}
 
 /* Keepalive only (30s idle, 5s interval, 3 probes). Never set
    the tunnel recv/send timeout on the control socket: its
@@ -62,13 +68,7 @@ static void opt_sock(int fd) {
 
 static void tunnel_sock(int fd) {
 	opt_sock(fd);
-	if(g_timeout > 0) {
-		struct timeval tv;
-		tv.tv_sec = g_timeout;
-		tv.tv_usec = 0;
-		setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-	}
+	if(g_timeout > 0) sock_timeout(fd, (int)g_timeout, 1, 1);
 }
 
 /* Zero timeout poll: dead iff ERR/HUP/NVAL, or POLLIN with a
@@ -341,59 +341,44 @@ static void send_error_close(int fd, unsigned char code) {
 static int hex_parse(const char *hex, unsigned char *out, size_t outlen);
 static unsigned char g_server_pk[32];
 static unsigned char g_server_sk[64];
-static int g_have_server_key;
 static unsigned char g_pinned_pk[32];
-static int g_have_pin;
 static int g_allow_cleartext = 0; /* encrypted by default */
 
+/* Key file: 64 hex pk chars, then an optional newline, then the
+   sk (128 hex chars in the current format, or 64 raw bytes in the
+   legacy format). The whole file is read first, so every error
+   path closes the fd. */
 static int load_server_key(const char *path) {
+	char buf[256], hexpk[65];
+	unsigned char sk[64];
+	ssize_t n, left;
+	const char *p;
+	char hexsk[129];
 	int fd = open(path, 0);
 	if(fd < 0) { dolog("%s: %s\n", path, strerror(errno)); return -1; }
-	char pkhex[65];
-	unsigned char sk[64];
-	ssize_t n = read(fd, pkhex, 64);
-	if(n != 64) { dolog("bad key file (need 64 hex pk chars)\n"); return -1; }
-	pkhex[64] = 0;
-	if(hex_parse(pkhex, g_server_pk, 32) < 0) { dolog("bad pk hex in key file\n"); return -1; }
-	/* skip newline after pk line (legacy files may lack it) */
-	{
-		char c;
-		if(read(fd, &c, 1) == 1 && c != '\n' && c != '\r') {
-			sk[0] = (unsigned char)c;
-			if(read(fd, sk+1, 63) != 63) { dolog("short sk\n"); return -1; }
-			goto sk_done;
-		}
-	}
-	{
-		unsigned char peek[129];
-		n = read(fd, peek, 128);
-		peek[n] = 0;
-		if(n == 128) {
-			int ishex = 1;
-			int i;
-			for(i=0;i<128;i++) {
-				char c = peek[i];
-				if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))) { ishex = 0; break; }
-			}
-			if(ishex && hex_parse((char*)peek, sk, 64) == 0) {
-				/* good, hex path */
-			} else {
-				/* binary path: peek holds first 64+ bytes */
-				memcpy(sk, peek, 64);
-			}
-		} else if(n == 64) {
-			memcpy(sk, peek, 64);
-		} else if(n > 64) {
-			memcpy(sk, peek, 64);
-		} else {
-			dolog("short sk in key file\n"); return -1;
-		}
-	}
-sk_done:
+	n = read(fd, buf, sizeof buf - 1);
 	close(fd);
+	if(n < 64) { dolog("short key file: %s\n", path); return -1; }
+	buf[n] = 0;
+	memcpy(hexpk, buf, 64);
+	hexpk[64] = 0;
+	if(hex_parse(hexpk, g_server_pk, 32) < 0) { dolog("bad pk hex in key file\n"); return -1; }
+	p = buf + 64;
+	left = n - 64;
+	while(left > 0 && (*p == '\n' || *p == '\r')) { p++; left--; }
+	if(left < 64) { dolog("short sk in key file\n"); return -1; }
+	if(left >= 128) {
+		memcpy(hexsk, p, 128);
+		hexsk[128] = 0;
+	}
+	if(left >= 128 && hex_parse(hexsk, sk, 64) == 0) {
+		/* current format: hex sk */
+	} else {
+		/* legacy format: raw sk */
+		memcpy(sk, p, 64);
+	}
 	memcpy(g_server_sk, sk, 64);
 	memset(sk, 0, sizeof sk);
-	g_have_server_key = 1;
 	return 0;
 }
 
@@ -482,11 +467,11 @@ static void stream_keys(const unsigned char *shared, const unsigned char *thash,
    for client connections and with it for listen sockets. */
 static int resolve_host(const char *host, unsigned short port, int passive, struct addrinfo **out) {
 	struct addrinfo hints;
+	char port_buf[8];
 	memset(&hints, 0, sizeof hints);
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 	if(passive) hints.ai_flags = AI_PASSIVE;
-	char port_buf[8];
 	snprintf(port_buf, sizeof port_buf, "%u", (unsigned)port);
 	return getaddrinfo(host, port_buf, &hints, out);
 }
@@ -501,32 +486,9 @@ union sockaddr_union {
 	struct sockaddr_in6 v6;
 };
 
-static int is_numeric_v4(const char *ip) {
-	unsigned int a,b,c,d;
-	char extra;
-	if(sscanf(ip, "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra) != 4) return 0;
-	return a < 256 && b < 256 && c < 256 && d < 256;
-}
-
-static int is_numeric_v6(const char *ip) {
-	struct in6_addr addr;
-	return inet_pton(AF_INET6, ip, &addr) == 1;
-}
-
 static int resolve_any(const char *host, unsigned short port, int passive, struct addrinfo **out) {
-	/* Numeric literal fast path: build a one-result list via
-	   getaddrinfo on the literal itself (no DNS), so callers
-	   get a uniform addrinfo to iterate. */
-	if(is_numeric_v4(host) || is_numeric_v6(host)) {
-		struct addrinfo hints;
-		memset(&hints, 0, sizeof hints);
-		hints.ai_family = AF_UNSPEC;
-		hints.ai_socktype = SOCK_STREAM;
-		if(passive) hints.ai_flags = AI_PASSIVE;
-		char port_buf[8];
-		snprintf(port_buf, sizeof port_buf, "%u", (unsigned)port);
-		return getaddrinfo(host, port_buf, &hints, out);
-	}
+	/* resolve_host() handles numeric literals too: getaddrinfo
+	   parses them without DNS. */
 	return resolve_host(host, port, passive, out);
 }
 
@@ -539,6 +501,18 @@ static struct addrinfo *pick_best(struct addrinfo *ai) {
 	for(p = ai; p; p = p->ai_next)
 		if(p->ai_family == AF_INET6) return p;
 	return 0;
+}
+
+/* Address of a known family first, then the first address of the
+   other family, so a dead v4 never blocks a live v6. */
+static void addr_order(struct addrinfo *ai, struct addrinfo *order[2]) {
+	order[0] = pick_best(ai);
+	order[1] = 0;
+	if(order[0]) {
+		struct addrinfo *p;
+		for(p = ai; p; p = p->ai_next)
+			if(p != order[0] && !order[1]) order[1] = p;
+	}
 }
 
 static int connect_to(const char *host, unsigned short port) {
@@ -558,16 +532,8 @@ static int connect_to(const char *host, unsigned short port) {
 	}
 	struct addrinfo *ai = 0;
 	if(resolve_any(host, port, 0, &ai) < 0) return -1;
-	/* Try every result in turn (v4 first via pick order is not
-	   enough alone: a dead v4 must not block a live v6). */
 	struct addrinfo *order[2];
-	order[0] = pick_best(ai);
-	order[1] = 0;
-	if(order[0]) {
-		struct addrinfo *p;
-		for(p = ai; p; p = p->ai_next)
-			if(p != order[0] && !order[1]) order[1] = p;
-	}
+	addr_order(ai, order);
 	int fd = -1;
 	int i;
 	for(i=0;i<2;i++) {
@@ -634,66 +600,55 @@ struct tunnel {
    copy could overwrite an element, so a running thread wrote done
    and fds through a stale or moved pointer. See tunnel_add,
    tunnel_reap and tunnel_start below. */
+/* Move one bufferful from in to out, encrypting with st when it is
+   set. Returns 1 when bytes moved, 0 when retried after EINTR, -1
+   on EOF or error, so the caller can half close that direction.
+   The cipher is a continuous stream, so chunks need no framing. */
+static int tunnel_pump(int infd, int outfd, struct ctr_stream *st) {
+	char buf[BUFSZ];
+	ssize_t n = recv(infd, buf, sizeof buf, 0);
+	if(n < 0) {
+		if(errno == EINTR) return 0;
+		return -1;
+	}
+	if(n == 0) return -1;
+	if(st) ctr_crypt(st, (unsigned char*)buf, (size_t)n);
+	return send_all(outfd, buf, (size_t)n) == 0 ? 1 : -1;
+}
+
 static void *tunnel_thread(void *data) {
 	struct tunnel *t = data;
 	int open0 = 1, open1 = 1;
 	struct pollfd fds[2];
-	fds[0].fd = t->fds; fds[0].events = POLLIN; fds[0].revents = 0;
-	fds[1].fd = t->fdc; fds[1].events = POLLIN; fds[1].revents = 0;
 	while(open0 || open1) {
+		int r, in, out, rc;
+		struct ctr_stream *st;
 		fds[0].fd = open0 ? t->fds : -1;
+		fds[0].events = POLLIN;
+		fds[0].revents = 0;
 		fds[1].fd = open1 ? t->fdc : -1;
-		int r = poll(fds, 2, -1);
+		fds[1].events = POLLIN;
+		fds[1].revents = 0;
+		r = poll(fds, 2, -1);
 		if(r < 0) {
 			if(errno == EINTR) continue;
 			break;
 		}
-		if(!((fds[0].revents | fds[1].revents) & (POLLIN|POLLERR|POLLHUP|POLLNVAL))) break;
-		int infd = (fds[0].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) ? t->fds : t->fdc;
-		int outfd = (infd == t->fds) ? t->fdc : t->fds;
-		if(!(fds[0].revents & POLLIN) && !(fds[1].revents & POLLIN)) {
-			if(infd == t->fds) open0 = 0;
-			else open1 = 0;
-			shutdown(outfd, SHUT_WR);
-			continue;
+		/* Pick the readable side. An error or hangup without POLLIN
+		   means that side is done, so half close the other way. */
+		if(fds[0].revents) {
+			in = t->fds; out = t->fdc;
+			st = t->enc ? &t->enc_up : 0;
+			rc = (fds[0].revents & POLLIN) ? tunnel_pump(in, out, st) : -1;
+			if(rc < 0) { open0 = 0; shutdown(out, SHUT_WR); }
+			if(rc > 0 || rc < 0) continue;
 		}
-		char buf[BUFSZ];
-		ssize_t n;
-		/* Tunnel channel is a raw byte stream: the cipher is
-		   continuous across chunks, so no per-chunk framing
-		   is needed. One recv plus one send per chunk.
-		   Close is signalled by TCP FIN via the half-close
-		   shutdown below. Framing is kept only on the
-		   control channel (CONN lines need parsing). */
-		n = recv(infd, buf, sizeof buf, 0);
-		if(n < 0) {
-			if(errno == EINTR) continue;
-			n = 0;
-		}
-		if(n == 0) {
-			if(infd == t->fds) open0 = 0;
-			else open1 = 0;
-			shutdown(outfd, SHUT_WR);
-			continue;
-		}
-		if(t->enc) {
-			if(infd == t->fds) ctr_crypt(&t->enc_up, (unsigned char*)buf, (size_t)n);
-			else ctr_crypt(&t->enc_dn, (unsigned char*)buf, (size_t)n);
-		}
-		{
-			size_t sent = 0;
-			int failed = 0;
-			while(sent < (size_t)n) {
-				ssize_t m = send(outfd, buf+sent, (size_t)n-sent, 0);
-				if(m < 0) {
-					if(errno == EINTR) continue;
-					failed = 1;
-					break;
-				}
-				if(m == 0) { failed = 1; break; }
-				sent += (size_t)m;
-			}
-			if(failed) break;
+		if(fds[1].revents) {
+			in = t->fdc; out = t->fds;
+			st = t->enc ? &t->enc_dn : 0;
+			rc = (fds[1].revents & POLLIN) ? tunnel_pump(in, out, st) : -1;
+			if(rc < 0) { open1 = 0; shutdown(out, SHUT_WR); }
+			if(rc > 0 || rc < 0) continue;
 		}
 	}
 	if(t->fdc >= 0) close(t->fdc);
@@ -705,7 +660,7 @@ static void *tunnel_thread(void *data) {
 }
 
 static unsigned char g_tun_up[32], g_tun_dn[32], g_tun_n24[32];
-static struct ctr_stream g_ctl_up, g_ctl_dn; /* control channel streams */
+static struct ctr_stream g_ctl_dn; /* control channel, server to client */
 static int g_ctl_valid;
 static int tunnel_start(struct tunnel **slot, int fds, int fdc, int enc) {
 	struct tunnel *t = malloc(sizeof *t);
@@ -767,7 +722,8 @@ static int tunnel_add(struct tunnel ***arr, size_t *count, size_t *cap, int fds,
 static void ctl_init_from(const unsigned char *shared, const unsigned char *thash) {
 	unsigned char up[32], dn[32], n24[32];
 	stream_keys(shared, thash, up, dn, n24);
-	ctr_init_ex(&g_ctl_up, up, n24);
+	/* The control channel is server to client only, so the up
+	   stream is never used. */
 	ctr_init_ex(&g_ctl_dn, dn, n24);
 	g_ctl_valid = 1;
 }
@@ -824,28 +780,50 @@ static int client_setup_sock(const char *upstream_ip, unsigned short upstream_po
 	return fd;
 }
 
-/* Arm a fresh spare socket, closing the old one first. The spare
-   is a raw stream socket that the server pairs with the next
-   public connection. It must never hold unread data: a readable
-   spare means it is gone, since only the server writes to it and
-   only after pairing. */
-static int arm_spare(const char *upstream_ip, unsigned short upstream_port, int old) {
-	if(old >= 0) kill_sock(old);
-	return client_setup_sock(upstream_ip, upstream_port, 2);
+/* The client keeps exactly one armed spare socket: a raw tunnel
+   socket that the server pairs with the next public connection.
+   Only the server writes to a spare, and only after pairing. */
+struct spare {
+	const char *ip;
+	unsigned short port;
+	int fd;
+};
+
+/* Drop the spare. RST it, so the server sees it gone at once and
+   does not pair it with a public connection that then hangs. */
+static void spare_drop(struct spare *sp) {
+	if(sp->fd >= 0) kill_sock(sp->fd);
+	sp->fd = -1;
+}
+
+/* Hand the spare to a tunnel thread. The thread owns the fd now. */
+static void spare_release(struct spare *sp) {
+	sp->fd = -1;
+}
+
+/* Arm a fresh spare, dropping the old one first. Returns -1 when
+   the upstream cannot be reached. */
+static int spare_arm(struct spare *sp, char *tsbuf, size_t tslen) {
+	const char *why = 0;
+	if(sp->fd >= 0) { spare_drop(sp); why = "dead"; }
+	sp->fd = client_setup_sock(sp->ip, sp->port, 2);
+	if(sp->fd < 0) return -1;
+	if(why) dolog("%sspare socket dead, re-arming\n", ts_prefix(tsbuf, tslen));
+	return 0;
 }
 
 /* Handshake control and spare. Retry every 2s until both are up.
    An attempt starts at once, so a restart recovers fast and a
    lost server only costs the poll interval. */
-static void client_reconnect(const char *upstream_ip, unsigned short upstream_port, int *control, int *next) {
+static void client_reconnect(int *control, struct spare *sp) {
 	*control = -1;
-	*next = -1;
+	sp->fd = -1;
 	while(*control < 0) {
-		*control = client_setup_sock(upstream_ip, upstream_port, 0);
+		*control = client_setup_sock(sp->ip, sp->port, 0);
 		if(*control < 0) goto retry;
-		*next = client_setup_sock(upstream_ip, upstream_port, 2);
-		if(*next < 0) { close(*control); *control = -1; goto retry; }
-		return;
+		if(spare_arm(sp, 0, 0) == 0) return;
+		close(*control);
+		*control = -1;
 retry:
 		{
 			struct timespec ts;
@@ -856,129 +834,108 @@ retry:
 	}
 }
 
+/* Read and act on one control frame. Returns -1 when the control
+   socket is gone. */
+static int client_ctrl_frame(int control, struct spare *sp, const char *local_ip, unsigned short local_port,
+                             struct tunnel ***threads, size_t *nthreads, size_t *capthreads, char *tsbuf, size_t tslen) {
+	unsigned char ftype;
+	unsigned char line[4096];
+	size_t linelen = 0;
+	if(recv_frame(control, &ftype, line, sizeof line, &linelen) < 0 || ftype == FT_ERROR || ftype == FT_CLOSE || !g_ctl_valid) return -1;
+	if(ftype != FT_CTRL) return 0;
+	ctr_crypt(&g_ctl_dn, line, linelen);
+	line[linelen] = 0;
+	dolog("%s%s\n", ts_prefix(tsbuf, tslen), (char*)line);
+	if(strncmp((char*)line, "CONN:", 5) != 0) return 0;
+	{
+		/* Parse CONN:ip:port or CONN:[v6]:port. The address is
+		   unused beyond the parse in both programs. */
+		char *cp = (char*)line + 5;
+		if(*cp == '[') {
+			char *rb = strchr(cp, ']');
+			if(!rb) return 0;
+			*rb = 0;
+			if(!strchr(rb+1, ':')) return 0;
+		} else {
+			char *colon = strchr(cp, ':');
+			if(!colon) return 0;
+			*colon = 0;
+		}
+	}
+	/* A dead spare must never be paired: the public peer would
+	   hang on a tunnel that never opens. */
+	if(sp->fd < 0 || !spare_alive(sp->fd)) {
+		if(spare_arm(sp, tsbuf, tslen) < 0) return -1;
+		return 0;
+	}
+	{
+		int local = connect_to(local_ip, local_port);
+		if(local < 0) {
+			dolog("%sconnect local: %s\n", ts_prefix(tsbuf, tslen), strerror(errno));
+			if(spare_arm(sp, tsbuf, tslen) < 0) return -1;
+			return 0;
+		}
+		if(tunnel_add(threads, nthreads, capthreads, local, sp->fd, 1) < 0) {
+			close(local);
+			if(spare_arm(sp, tsbuf, tslen) < 0) return -1;
+			return 0;
+		}
+		spare_release(sp);
+	}
+	if(spare_arm(sp, tsbuf, tslen) < 0) return -1;
+	return 0;
+}
+
 static void client_doit(const char *upstream_ip, unsigned short upstream_port, const char *local_ip, unsigned short local_port) {
 	int control = -1;
-	int next = -1;
+	struct spare sp;
 	char tsbuf[64];
 	struct tunnel **threads = 0;
 	size_t nthreads = 0, capthreads = 0;
-	client_reconnect(upstream_ip, upstream_port, &control, &next);
+	sp.ip = upstream_ip;
+	sp.port = upstream_port;
+	sp.fd = -1;
+	client_reconnect(&control, &sp);
 	while(1) {
+		struct pollfd fds[2];
+		int r;
 		tunnel_reap(&threads, &nthreads);
-		/* The spare is re-armed before every wait, so a dead spare
-		   never blocks the client. */
-		if(next < 0) {
-			next = arm_spare(upstream_ip, upstream_port, next);
-			if(next < 0) goto lost_control;
+		/* The spare is armed before every wait, so a dead spare
+		   never blocks the client and never holds up a server
+		   that is waiting for one. */
+		if(sp.fd < 0 && spare_arm(&sp, tsbuf, sizeof tsbuf) < 0) goto lost_control;
+		fds[0].fd = control; fds[0].events = POLLIN; fds[0].revents = 0;
+		fds[1].fd = sp.fd; fds[1].events = POLLIN; fds[1].revents = 0;
+		do { r = poll(fds, 2, SPARE_TICK_MS); } while(r < 0 && errno == EINTR);
+		if(r < 0) goto lost_control;
+		if(r == 0) {
+			/* Tick: replace a spare that died silently, e.g.
+			   dropped NAT state. Waiting for a CONN would
+			   deadlock, since the server sends none while it
+			   has no spare. */
+			if(!spare_alive(sp.fd) && spare_arm(&sp, tsbuf, sizeof tsbuf) < 0) goto lost_control;
+			continue;
 		}
-		{
-			struct pollfd fds[2];
-			int r;
-			fds[0].fd = control; fds[0].events = POLLIN; fds[0].revents = 0;
-			fds[1].fd = next; fds[1].events = POLLIN; fds[1].revents = 0;
-			do { r = poll(fds, 2, SPARE_TICK_MS); } while(r < 0 && errno == EINTR);
-			if(r < 0) goto lost_control;
-			if(r == 0) {
-				/* Tick: a spare that died silently (dropped NAT
-				   state, blackholed path) is replaced here,
-				   instead of waiting for a CONN that the server
-				   cannot send while it has no spare. */
-				if(!spare_alive(next)) {
-					dolog("%sspare socket dead, re-arming\n", ts_prefix(tsbuf, sizeof tsbuf));
-					next = arm_spare(upstream_ip, upstream_port, next);
-					if(next < 0) goto lost_control;
-				}
+		/* Readable is not death: the server pairs the spare before
+		   it writes CONN, so tunnel bytes can be queued here
+		   already. Only a zero length peek means FIN. */
+		if(fds[1].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) {
+			if(fds[1].revents & (POLLERR|POLLHUP|POLLNVAL) || !spare_alive(sp.fd)) {
+				if(spare_arm(&sp, tsbuf, sizeof tsbuf) < 0) goto lost_control;
 				continue;
 			}
-			if(fds[1].revents & (POLLERR|POLLHUP|POLLNVAL)) {
-				/* Error: the spare is unusable. RST it, so the
-				   server drops its side at once. */
-				dolog("%sspare socket dead, re-arming\n", ts_prefix(tsbuf, sizeof tsbuf));
-				kill_sock(next);
-				next = client_setup_sock(upstream_ip, upstream_port, 2);
-				if(next < 0) goto lost_control;
-				continue;
-			}
-			if(fds[1].revents & POLLIN) {
-				/* Readable is not death: the server pairs the
-				   spare first and writes the CONN frame after, so
-				   tunnel bytes can be queued here already. Only a
-				   zero length peek means FIN. Anything else is
-				   left for the CONN frame below. */
-				if(!spare_alive(next)) {
-					dolog("%sspare socket dead, re-arming\n", ts_prefix(tsbuf, sizeof tsbuf));
-					kill_sock(next);
-					next = client_setup_sock(upstream_ip, upstream_port, 2);
-					if(next < 0) goto lost_control;
-					continue;
-				}
-			}
-			if(fds[0].revents & (POLLERR|POLLHUP|POLLNVAL)) goto lost_control;
-			if(!(fds[0].revents & POLLIN)) continue;
 		}
-		{
-			unsigned char ftype;
-			unsigned char line[4096];
-			size_t linelen = 0;
-			if(recv_frame(control, &ftype, line, sizeof line, &linelen) < 0 || ftype == FT_ERROR || ftype == FT_CLOSE || !g_ctl_valid) goto lost_control;
-			if(ftype != FT_CTRL) continue;
-			ctr_crypt(&g_ctl_dn, line, linelen);
-			line[linelen] = 0;
-			dolog("%s%s\n", ts_prefix(tsbuf, sizeof tsbuf), (char*)line);
-			if(strncmp((char*)line, "CONN:", 5) != 0) continue;
-			{
-				/* Parse CONN:ip:port or CONN:[v6]:port.
-				   Address is unused beyond this in both programs. */
-				char *cp = (char*)line + 5;
-				if(*cp == '[') {
-					char *rb = strchr(cp, ']');
-					if(!rb) continue;
-					*rb = 0;
-					if(!strchr(rb+1, ':')) continue;
-				} else {
-					char *colon = strchr(cp, ':');
-					if(!colon) continue;
-					*colon = 0;
-				}
-				if(!spare_alive(next)) {
-					dolog("%sspare socket dead, re-arming\n", ts_prefix(tsbuf, sizeof tsbuf));
-					next = arm_spare(upstream_ip, upstream_port, next);
-					if(next < 0) goto lost_control;
-					continue;
-				}
-				{
-					int local = connect_to(local_ip, local_port);
-					if(local < 0) {
-						dolog("connect local: %s\n", strerror(errno));
-						/* Drop the paired spare: the server must
-						   see it gone, not keep it for a client
-						   that was never served. */
-						kill_sock(next);
-						next = client_setup_sock(upstream_ip, upstream_port, 2);
-						if(next < 0) goto lost_control;
-						continue;
-					}
-					if(tunnel_add(&threads, &nthreads, &capthreads, local, next, 1) < 0) {
-						kill_sock(next);
-						close(local);
-						next = client_setup_sock(upstream_ip, upstream_port, 2);
-						if(next < 0) goto lost_control;
-						continue;
-					}
-					/* next is owned by the tunnel thread now */
-					next = client_setup_sock(upstream_ip, upstream_port, 2);
-					if(next < 0) goto lost_control;
-				}
-			}
-		}
+		if(fds[0].revents & (POLLERR|POLLHUP|POLLNVAL)) goto lost_control;
+		if(!(fds[0].revents & POLLIN)) continue;
+		if(client_ctrl_frame(control, &sp, local_ip, local_port, &threads, &nthreads, &capthreads, tsbuf, sizeof tsbuf) < 0) goto lost_control;
 		continue;
 lost_control:
 		/* Lost control: tear down control and spare, then
 		   re-handshake with backoff. Tunnels stay up. */
 		dolog("%slost control socket, reconnecting\n", ts_prefix(tsbuf, sizeof tsbuf));
 		if(control >= 0) close(control);
-		if(next >= 0) kill_sock(next);
-		client_reconnect(upstream_ip, upstream_port, &control, &next);
+		spare_drop(&sp);
+		client_reconnect(&control, &sp);
 	}
 }
 
@@ -989,197 +946,194 @@ lost_control:
    bounds the wait for a port scanner that connects and stalls. */
 #define HELLO_WAIT_MS 1500
 
+/* The server keeps one control socket and one armed spare. The
+   public listener pairs the spare with each accepted peer. */
+struct server {
+	int su;          /* admin listener */
+	int sc;          /* public listener */
+	int control;     /* control socket, -1 when none */
+	int spare;       /* armed spare socket, -1 when none */
+	int spare_enc;   /* spare is an encrypted tunnel socket */
+	struct tunnel **threads;
+	size_t nthreads;
+	size_t capthreads;
+	char tsbuf[64];
+};
+
+static void serve_drop_spare(struct server *sv) {
+	if(sv->spare >= 0) kill_sock(sv->spare);
+	sv->spare = -1;
+}
+
+static void serve_drop_control(struct server *sv) {
+	if(sv->control >= 0) close(sv->control);
+	sv->control = -1;
+}
+
 /* Run the handshake on an already accepted socket. The caller
    sorts out port scanners: a peer that is not the NT client
    fails the MAC check and leaves the control socket untouched.
    Only a peer that holds the shared secret can replace a live
    control socket. */
-static void server_handshake(int conn, int *control, int *next_up, int *next_enc) {
-	{
-		struct timeval tv;
-		tv.tv_sec = 5;
-		tv.tv_usec = 0;
-		setsockopt(conn, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-	}
+static void server_handshake(struct server *sv, int conn) {
 	union sockaddr_union addr;
 	socklen_t alen = sizeof addr;
 	char addrstr[64] = "?";
+	/* One line per handshake outcome: the timestamp and the result
+	   go out in one dprintf(), so concurrent handshakes never
+	   interleave inside a line. */
+	char log_prefix[64];
+	unsigned char eph_sk[32], eph_pk[32], nonce[16];
+	unsigned char sh[117];
+	unsigned char ftype, ch[65];
+	unsigned char req;
+	unsigned char shared[32], thash[32], expect_mac[32];
+	size_t plen = 0;
+	int enc;
+
 	if(getpeername(conn, (struct sockaddr*)&addr, &alen) == 0) format_addr(&addr, addrstr, sizeof addrstr);
-	unsigned char eph_sk[32], eph_pk[32];
+	ts_prefix(log_prefix, sizeof log_prefix);
+	/* A peer that never reads must not block the handshake. */
+	sock_timeout(conn, 5, 1, 0);
 	rng_fill(eph_sk, 32);
 	x25519_base(eph_pk, eph_sk);
-	unsigned char nonce[16];
 	rng_fill(nonce, 16);
-	unsigned char cap = g_allow_cleartext ? 1 : 0;
-	unsigned char sh[117];
 	memcpy(sh, NT_MAGIC, 4);
 	memcpy(sh+4, eph_pk, 32);
-	sh[36] = cap;
+	sh[36] = g_allow_cleartext ? 1 : 0;
 	memcpy(sh+37, nonce, 16);
-	if(ed_sign(sh+53, sh, 53) != 0) { kill_sock(conn); return; }
-	/* One line per handshake outcome: the timestamp and the
-	   result go out in one dprintf(), so concurrent handshakes
-	   never interleave inside a line. */
-	char log_prefix[64];
-	ts_prefix(log_prefix, sizeof log_prefix);
-	if(send_frame(conn, FT_SH, sh, 117) < 0) {
-		dolog("%sCONN: %s ... rejected!\n", log_prefix, addrstr);
-		kill_sock(conn);
-		return;
-	}
+	if(ed_sign(sh+53, sh, 53) != 0) goto reject;
+	if(send_frame(conn, FT_SH, sh, 117) < 0) goto reject;
 	/* The only blocking read: a peer that never sends a client
 	   hello is killed after HELLO_WAIT_MS. */
-	unsigned char ftype;
-	unsigned char ch[65];
-	size_t plen = 0;
-	if(wait_frame(conn, HELLO_WAIT_MS, &ftype, ch, 65, &plen) != 0 || ftype != FT_CH || plen != 65) {
-		dolog("%sCONN: %s ... rejected!\n", log_prefix, addrstr);
-		kill_sock(conn);
-		return;
-	}
-	const unsigned char *eph_c = ch;
-	unsigned char req = ch[32];
-	const unsigned char *mac = ch + 33;
-	if(req > 2) { dolog("%sCONN: %s ... rejected!\n", log_prefix, addrstr); kill_sock(conn); return; }
-	unsigned char shared[32], thash[32], expect_mac[32];
-	x25519_mul(shared, eph_sk, eph_c);
-	transcript_hash(eph_pk, eph_c, cap, nonce, req, thash);
+	if(wait_frame(conn, HELLO_WAIT_MS, &ftype, ch, 65, &plen) != 0 || ftype != FT_CH || plen != 65) goto reject;
+	req = ch[32];
+	if(req > 2) goto reject;
+	x25519_mul(shared, eph_sk, ch);
+	transcript_hash(eph_pk, ch, sh[36], nonce, req, thash);
 	auth_mac(shared, thash, req, expect_mac);
-	if(!ct_equal((char*)mac, (char*)expect_mac, 32)) {
-		dolog("%sCONN: %s ... rejected!\n", log_prefix, addrstr);
-		kill_sock(conn);
-		return;
-	}
+	if(!ct_equal((char*)ch + 33, (char*)expect_mac, 32)) goto reject;
 	memset(eph_sk, 0, sizeof eph_sk);
 	opt_sock(conn);
-	{
-		/* Keepalive is on, so drop the handshake send timeout. */
-		struct timeval tv;
-		tv.tv_sec = 0;
-		tv.tv_usec = 0;
-		setsockopt(conn, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-	}
+	sock_timeout(conn, 0, 1, 0);   /* keepalive is on now */
 	if(req == 0) {
-		/* Reaching here means the peer holds the shared secret,
-		   so a takeover of a live control socket is the real
-		   client restarting. A port scanner cannot get here. */
-		if(*control >= 0) { dolog("%scontrol takeover\n", log_prefix); close(*control); }
-		if(*next_up >= 0) { kill_sock(*next_up); *next_up = -1; }
-		*control = conn;
+		/* Reaching here means the peer holds the shared secret, so
+		   a takeover of a live control socket is the real client
+		   restarting. A port scanner cannot get here. */
+		if(sv->control >= 0) { dolog("%scontrol takeover\n", log_prefix); serve_drop_control(sv); }
+		serve_drop_spare(sv);
+		sv->control = conn;
 		ctl_init_from(shared, thash);
 		dolog("%sCONN: %s ... OK (admin)\n", log_prefix, addrstr);
-	} else {
-		int enc = (req == 2);
-		if(!enc && !g_allow_cleartext) {
-			dolog("%sCONN: %s ... rejected cleartext not allowed\n", log_prefix, addrstr);
-			kill_sock(conn);
-			memset(shared, 0, sizeof shared);
-			return;
-		}
-		dolog("%sCONN: %s ... OK (tunnel%s)\n", log_prefix, addrstr, enc ? " enc" : "");
-		if(*next_up >= 0) kill_sock(*next_up);
-		*next_up = conn;
-		*next_enc = enc;
-		tun_init_from(shared, thash);
+		memset(shared, 0, sizeof shared);
+		return;
 	}
+	enc = (req == 2);
+	if(!enc && !g_allow_cleartext) {
+		dolog("%sCONN: %s ... rejected cleartext not allowed\n", log_prefix, addrstr);
+		goto reject;
+	}
+	dolog("%sCONN: %s ... OK (tunnel%s)\n", log_prefix, addrstr, enc ? " enc" : "");
+	serve_drop_spare(sv);
+	sv->spare = conn;
+	sv->spare_enc = enc;
+	tun_init_from(shared, thash);
 	memset(shared, 0, sizeof shared);
+	return;
+reject:
+	dolog("%sCONN: %s ... rejected!\n", log_prefix, addrstr);
+	kill_sock(conn);
 }
 
-/* Pair a live spare with a public connection and hand both to a
-   tunnel thread. */
-static void accept_public(int sc, int *control, int *next_up, int *next_enc, struct tunnel ***threads, size_t *nthreads, size_t *capthreads) {
+/* Take one admin peer through the handshake. A dead spare is
+   dropped first, so it can never be paired later. */
+static void serve_admin(struct server *sv) {
 	union sockaddr_union addr;
-	char tsbuf[64];
 	socklen_t alen = sizeof addr;
-	int conn = accept(sc, (struct sockaddr*)&addr, &alen);
+	int conn = accept(sv->su, (struct sockaddr*)&addr, &alen);
 	if(conn < 0) return;
+	if(sv->spare >= 0 && !spare_alive(sv->spare)) serve_drop_spare(sv);
+	server_handshake(sv, conn);
+}
+
+/* Pair the armed spare with one public connection and hand both to
+   a tunnel thread. Without a live spare the public peer is reset at
+   once, so it never hangs on a tunnel that cannot open. */
+static void serve_public(struct server *sv) {
+	union sockaddr_union addr;
+	socklen_t alen = sizeof addr;
 	char addrstr[64];
+	char *s = sv->tsbuf;
+	int conn = accept(sv->sc, (struct sockaddr*)&addr, &alen);
+	if(conn < 0) return;
 	format_addr(&addr, addrstr, sizeof addrstr);
-	if(*next_up < 0 || !spare_alive(*next_up)) {
-		/* Never pair a dead spare: the public peer would hang on
-		   a tunnel that never opens. Reset it at once instead. */
-		if(*next_up >= 0) { kill_sock(*next_up); *next_up = -1; }
-		dolog("%sCONN: %s refused, no spare\n", ts_prefix(tsbuf, sizeof tsbuf), addrstr);
+	if(sv->spare < 0 || !spare_alive(sv->spare)) {
+		serve_drop_spare(sv);
+		dolog("%sCONN: %s refused, no spare\n", ts_prefix(s, sizeof sv->tsbuf), addrstr);
 		kill_sock(conn);
 		return;
 	}
 	{
 		unsigned char msg[80];
 		int mlen = snprintf((char*)msg, sizeof msg, "CONN:%s", addrstr);
-		if(mlen < 0) mlen = 0;
-		if(mlen > (int)sizeof msg) mlen = sizeof msg;
-		ctr_crypt(&g_ctl_dn, msg, (size_t)mlen); /* control is server->client only: both ends use dn stream */
-		if(send_frame(*control, FT_CTRL, msg, (size_t)mlen) < 0) {
-			dolog("%slost control socket\n", ts_prefix(tsbuf, sizeof tsbuf));
-			close(*control);
-			*control = -1;
-			kill_sock(*next_up);
-			*next_up = -1;
+		if(mlen < 0 || mlen >= (int)sizeof msg) mlen = 0;
+		/* Control traffic is server to client only, so both ends
+		   use the dn stream. */
+		ctr_crypt(&g_ctl_dn, msg, (size_t)mlen);
+		if(send_frame(sv->control, FT_CTRL, msg, (size_t)mlen) < 0) {
+			dolog("%slost control socket\n", ts_prefix(s, sizeof sv->tsbuf));
+			serve_drop_control(sv);
+			serve_drop_spare(sv);
 			kill_sock(conn);
 			return;
 		}
 	}
-	if(tunnel_add(threads, nthreads, capthreads, *next_up, conn, *next_enc) < 0) {
-		kill_sock(*next_up);
+	if(tunnel_add(&sv->threads, &sv->nthreads, &sv->capthreads, sv->spare, conn, sv->spare_enc) < 0) {
+		serve_drop_spare(sv);
 		kill_sock(conn);
-		*next_up = -1;
 		return;
 	}
-	*next_up = -1;
+	sv->spare = -1;
 }
 
 static void server_doit(const char *up_ip, unsigned short up_port, const char *client_ip, unsigned short client_port) {
-	int su = listen_on(up_ip, up_port);
-	if(su < 0) { dolog("listen admin: %s\n", strerror(errno)); return; }
-	int sc = listen_on(client_ip, client_port);
-	if(sc < 0) { dolog("listen public: %s\n", strerror(errno)); return; }
-	int control = -1;
-	int next_up = -1;
-	int next_enc = 0;
-	char tsbuf[64];
-	struct tunnel **threads = 0;
-	size_t nthreads = 0, capthreads = 0;
+	struct server sv;
+	memset(&sv, 0, sizeof sv);
+	sv.su = listen_on(up_ip, up_port);
+	if(sv.su < 0) { dolog("listen admin: %s\n", strerror(errno)); return; }
+	sv.sc = listen_on(client_ip, client_port);
+	if(sv.sc < 0) { dolog("listen public: %s\n", strerror(errno)); return; }
+	sv.control = -1;
+	sv.spare = -1;
 	while(1) {
 		struct pollfd fds[4];
 		int r;
-		tunnel_reap(&threads, &nthreads);
+		char *s = sv.tsbuf;
+		tunnel_reap(&sv.threads, &sv.nthreads);
 		/* One poll over everything. No blocking accept, so the
 		   public port, the admin port and the control socket
 		   stay live while a spare is missing. */
-		fds[0].fd = su; fds[0].events = POLLIN; fds[0].revents = 0;
-		fds[1].fd = sc; fds[1].events = POLLIN; fds[1].revents = 0;
-		fds[2].fd = control; fds[2].events = POLLIN; fds[2].revents = 0;
-		fds[3].fd = next_up; fds[3].events = POLLIN; fds[3].revents = 0;
+		fds[0].fd = sv.su; fds[0].events = POLLIN; fds[0].revents = 0;
+		fds[1].fd = sv.sc; fds[1].events = POLLIN; fds[1].revents = 0;
+		fds[2].fd = sv.control; fds[2].events = POLLIN; fds[2].revents = 0;
+		fds[3].fd = sv.spare; fds[3].events = POLLIN; fds[3].revents = 0;
 		do { r = poll(fds, 4, -1); } while(r < 0 && errno == EINTR);
 		if(r < 0) continue;
 		/* Order matters. A dead control or spare is handled first,
 		   so a peer that arrives at the same moment never
 		   replaces a live control socket. */
 		if(fds[2].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) {
-			dolog("%slost control socket\n", ts_prefix(tsbuf, sizeof tsbuf));
-			if(control >= 0) close(control);
-			control = -1;
+			dolog("%slost control socket\n", ts_prefix(s, sizeof sv.tsbuf));
+			serve_drop_control(&sv);
 			continue;
 		}
 		if(fds[3].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) {
-			dolog("%slost spare upstream socket\n", ts_prefix(tsbuf, sizeof tsbuf));
-			kill_sock(next_up);
-			next_up = -1;
+			dolog("%slost spare upstream socket\n", ts_prefix(s, sizeof sv.tsbuf));
+			serve_drop_spare(&sv);
 			continue;
 		}
-		if(fds[0].revents & POLLIN) {
-			union sockaddr_union addr;
-			socklen_t alen = sizeof addr;
-			int conn = accept(su, (struct sockaddr*)&addr, &alen);
-			if(conn < 0) continue;
-			if(next_up >= 0 && !spare_alive(next_up)) { kill_sock(next_up); next_up = -1; }
-			server_handshake(conn, &control, &next_up, &next_enc);
-			continue;
-		}
-		if(fds[1].revents & POLLIN) {
-			accept_public(sc, &control, &next_up, &next_enc, &threads, &nthreads, &capthreads);
-			continue;
-		}
+		if(fds[0].revents & POLLIN) { serve_admin(&sv); continue; }
+		if(fds[1].revents & POLLIN) { serve_public(&sv); continue; }
 	}
 }
 
@@ -1228,8 +1182,14 @@ static int read_secret_file(const char *path) {
 	if(n == 0) { dolog("empty secret in file: %s\n", path); return -1; }
 	g_secret = g_secret_buf;
 	g_secret_len = (size_t)n;
-	g_secret_from_file = 1;
 	return 0;
+}
+
+/* Lower case hex into out. out needs 2*len+1 bytes. */
+static void hex_write(char *out, const unsigned char *in, size_t len) {
+	size_t i;
+	for(i=0;i<len;i++) snprintf(out + 2*i, 3, "%02x", in[i]);
+	out[2*len] = 0;
 }
 
 static int hex_parse(const char *hex, unsigned char *out, size_t outlen) {
@@ -1245,34 +1205,28 @@ static int hex_parse(const char *hex, unsigned char *out, size_t outlen) {
 
 static int do_genkey(const char *outpath) {
 	unsigned char pk[32], sk[64];
+	char hexpk[65], hexsk[129], buf[200];
+	int fd, m, rc = 1;
 	if(NCRYPT_SIGN_KEYPAIR(pk, sk) != 0) { dolog("crypto_sign_keypair failed\n"); return 1; }
-	int fd = open(outpath, 1|64|512, 0600);
-	if(fd < 0) { dolog("%s: %s\n", outpath, strerror(errno)); return 1; }
+	hex_write(hexpk, pk, sizeof pk);
+	hex_write(hexsk, sk, sizeof sk);
+	fd = open(outpath, 1|64|512, 0600);
+	if(fd < 0) { dolog("%s: %s\n", outpath, strerror(errno)); goto out; }
 	/* file format: hex pk + newline + hex sk + newline, for pinning */
-	char buf[200];
-	int m = snprintf(buf, sizeof buf, "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
-		pk[0],pk[1],pk[2],pk[3],pk[4],pk[5],pk[6],pk[7],pk[8],pk[9],pk[10],pk[11],pk[12],pk[13],pk[14],pk[15],pk[16],pk[17],pk[18],pk[19],pk[20],pk[21],pk[22],pk[23],pk[24],pk[25],pk[26],pk[27],pk[28],pk[29],pk[30],pk[31]);
-	if(m <= 0 || write(fd, buf, (size_t)m) != m) { dolog("write key: %s\n", strerror(errno)); return 1; }
-	{
-		char hexsk[129];
-		int i;
-		for(i=0;i<64;i++) snprintf(hexsk+2*i, 3, "%02x", sk[i]);
-		hexsk[128] = 0;
-		if(write(fd, hexsk, 128) != 128) { dolog("write key: %s\n", strerror(errno)); return 1; }
-		if(write(fd, "\n", 1) != 1) { dolog("write key: %s\n", strerror(errno)); return 1; }
+	m = snprintf(buf, sizeof buf, "%s\n%s\n", hexpk, hexsk);
+	if(m <= 0 || write(fd, buf, (size_t)m) != m) {
+		dolog("write key: %s\n", strerror(errno));
+		close(fd);
+		goto out;
 	}
-	close(fd);
-	{
-		char hexpk[65];
-		int i;
-		for(i=0;i<32;i++) snprintf(hexpk+2*i, 3, "%02x", pk[i]);
-		hexpk[64] = 0;
-		dolog("public key: %s\n", hexpk);
-		dolog("private key written to %s (0600)\n", outpath);
-		dolog("pin the public key on the peer with the matching hex string\n");
-	}
+	if(close(fd) < 0) { dolog("write key: %s\n", strerror(errno)); goto out; }
+	dolog("public key: %s\n", hexpk);
+	dolog("private key written to %s (0600)\n", outpath);
+	dolog("pin the public key on the peer with the matching hex string\n");
+	rc = 0;
+out:
 	memset(sk, 0, sizeof sk);
-	return 0;
+	return rc;
 }
 
 static int parse_ip_port(const char *s, char *ip, size_t ip_cap, unsigned short *port) {
@@ -1317,150 +1271,140 @@ static int parse_ip_port(const char *s, char *ip, size_t ip_cap, unsigned short 
 	return 0;
 }
 
+/* One parsed command line. Text options are strdup()ed, so argv[]
+   can be cleared later for --silent-argv. */
+struct options {
+	char *mode;
+	char *secret;
+	char *public_addr;
+	char *local_addr;
+	char *admin_addr;
+	char *timeout_s;
+	char *secret_file;
+	char *server_key;
+	char *server_pubkey;
+	int allow_clear;
+	int silent_argv;
+};
+
+/* Match "--name VALUE" and "--name=VALUE" in one place. Returns 1
+   and stores the value when argv[i] is that option, else 0. */
+static int opt_find(char **argv, int argc, int *i, const char *name, char **slot) {
+	size_t n = strlen(name);
+	if(strcmp(argv[*i], name) == 0 && *i + 1 < argc) {
+		*slot = strdup(argv[++(*i)]);
+		return 1;
+	}
+	if(strncmp(argv[*i], name, n) == 0 && argv[*i][n] == '=') {
+		*slot = strdup(argv[*i] + n + 1);
+		return 1;
+	}
+	return 0;
+}
+
+/* Split a CLI address into ip and port. Unix socket paths start
+   with '/' and carry no port. */
+static int opt_addr(const char *text, const char *what, char *ip, size_t ip_cap, unsigned short *port) {
+	if(parse_ip_port(text, ip, ip_cap, port) < 0) {
+		dolog("bad --%s address: %s\n", what, text);
+		return -1;
+	}
+	return 0;
+}
+
+/* Clear argv[] for stealth (ps aux). The kernel already exposed
+   the strings at exec time, so this only helps against later
+   inspection. Options were strdup()ed during parsing. */
+static void hide_argv(int argc, char **argv) {
+	int i;
+	for(i=1;i<argc;i++) memset(argv[i], 0, strlen(argv[i]));
+	/* ./natsrv -> natsrv, so ps shows a bare name. Clear both tail
+	   bytes, so no leftover char leaks into the next entry. */
+	if(argv[0][0] == '.' && argv[0][1] == '/') {
+		size_t n = strlen(argv[0]) - 2;
+		memmove(argv[0], argv[0] + 2, n);
+		argv[0][n] = 0;
+		argv[0][n+1] = 0;
+	}
+}
+
 int main(int argc, char **argv) {
+	struct options o;
+	int i;
 	/* --genkey FILENAME is a standalone mode: generate a keypair
 	   and exit. Single option for both roles. */
 	if(argc >= 2 && strcmp(argv[1], "--genkey") == 0) {
-		const char *outpath = 0;
-		int i;
-		for(i=2;i<argc;i++) {
-			if(outpath) { dolog("unrecognized argument: %s\n", argv[i]); return 1; }
-			else outpath = argv[i];
-		}
-		if(!outpath) { dolog("--genkey requires a filename: --genkey FILENAME\n"); return 1; }
-		return do_genkey(outpath);
+		if(argc != 3) { dolog("--genkey requires exactly one filename: --genkey FILENAME\n"); return 1; }
+		return do_genkey(argv[2]);
 	}
 	if(argc < 2 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
 		usage(argv[0]);
-		if(argc < 2) return 1;
-		/* python prints desc then still runs argparse which errors on -h;
-		   we just show help and exit 0 for explicit -h/--help */
-		return 0;
+		return argc < 2 ? 1 : 0;
 	}
-	const char *secret = 0;
-	const char *mode = 0;
-	const char *public_addr = 0;
-	const char *local_addr = 0;
-	const char *admin_addr = 0;
-	const char *timeout_s = 0;
-	const char *secret_file = 0;
-	const char *server_key = 0;
-	const char *server_pubkey = 0;
-	int allow_clear = -1;
-	int silent_argv = 0;
-	int i;
+	memset(&o, 0, sizeof o);
+	o.allow_clear = -1;
 	for(i=1;i<argc;i++) {
-		if(strcmp(argv[i], "--secret") == 0 && i+1 < argc) secret = strdup(argv[++i]);
-		else if(strcmp(argv[i], "--mode") == 0 && i+1 < argc) mode = strdup(argv[++i]);
-		else if(strcmp(argv[i], "--public") == 0 && i+1 < argc) public_addr = strdup(argv[++i]);
-		else if(strcmp(argv[i], "--local") == 0 && i+1 < argc) local_addr = strdup(argv[++i]);
-		else if(strcmp(argv[i], "--admin") == 0 && i+1 < argc) admin_addr = strdup(argv[++i]);
-		else if(strcmp(argv[i], "--timeout") == 0 && i+1 < argc) timeout_s = strdup(argv[++i]);
-		else if(strcmp(argv[i], "--secret-file") == 0 && i+1 < argc) secret_file = strdup(argv[++i]);
-		else if(strcmp(argv[i], "--server-key") == 0 && i+1 < argc) server_key = strdup(argv[++i]);
-		else if(strcmp(argv[i], "--server-pubkey") == 0 && i+1 < argc) server_pubkey = strdup(argv[++i]);
-		else if(strcmp(argv[i], "--silent-argv") == 0) silent_argv = 1;
-		else if(strcmp(argv[i], "--allow-cleartext") == 0) allow_clear = 1;
-		else if(strncmp(argv[i], "--secret=", 9) == 0) secret = strdup(argv[i]+9);
-		else if(strncmp(argv[i], "--mode=", 7) == 0) mode = strdup(argv[i]+7);
-		else if(strncmp(argv[i], "--public=", 9) == 0) public_addr = strdup(argv[i]+9);
-		else if(strncmp(argv[i], "--local=", 8) == 0) local_addr = strdup(argv[i]+8);
-		else if(strncmp(argv[i], "--admin=", 8) == 0) admin_addr = strdup(argv[i]+8);
-		else if(strncmp(argv[i], "--timeout=", 10) == 0) timeout_s = strdup(argv[i]+10);
-		else if(strncmp(argv[i], "--secret-file=", 14) == 0) secret_file = strdup(argv[i]+14);
-		else if(strncmp(argv[i], "--server-key=", 13) == 0) server_key = strdup(argv[i]+13);
-		else if(strncmp(argv[i], "--server-pubkey=", 16) == 0) server_pubkey = strdup(argv[i]+16);
-		else {
-			dolog("unrecognized argument: %s\n", argv[i]);
-			return 1;
-		}
-	}
-	if(secret && secret_file) {
-		dolog("--secret and --secret-file are mutually exclusive\n");
+		if(opt_find(argv, argc, &i, "--mode", &o.mode)) continue;
+		if(opt_find(argv, argc, &i, "--secret", &o.secret)) continue;
+		if(opt_find(argv, argc, &i, "--public", &o.public_addr)) continue;
+		if(opt_find(argv, argc, &i, "--local", &o.local_addr)) continue;
+		if(opt_find(argv, argc, &i, "--admin", &o.admin_addr)) continue;
+		if(opt_find(argv, argc, &i, "--timeout", &o.timeout_s)) continue;
+		if(opt_find(argv, argc, &i, "--secret-file", &o.secret_file)) continue;
+		if(opt_find(argv, argc, &i, "--server-key", &o.server_key)) continue;
+		if(opt_find(argv, argc, &i, "--server-pubkey", &o.server_pubkey)) continue;
+		if(strcmp(argv[i], "--silent-argv") == 0) { o.silent_argv = 1; continue; }
+		if(strcmp(argv[i], "--allow-cleartext") == 0) { o.allow_clear = 1; continue; }
+		dolog("unrecognized argument: %s\n", argv[i]);
 		return 1;
 	}
-	if(!mode) { dolog("--mode is required (server or client)\n"); return 1; }
-	if(!secret && !secret_file) { dolog("--secret or --secret-file is required\n"); return 1; }
-	if(!admin_addr) { dolog("--admin is required\n"); return 1; }
-	if(strcmp(mode, "server") == 0 && !public_addr) { dolog("--public is required in server mode\n"); return 1; }
-	if(strcmp(mode, "client") == 0 && !local_addr) { dolog("--local is required in client mode\n"); return 1; }
-	if(!public_addr) public_addr = "0.0.0.0:8080";
-	if(!local_addr) local_addr = "localhost:80";
-	if(!admin_addr) admin_addr = "0.0.0.0:8081";
-	if(timeout_s) {
+	if(o.secret && o.secret_file) { dolog("--secret and --secret-file are mutually exclusive\n"); return 1; }
+	if(!o.mode) { dolog("--mode is required (server or client)\n"); return 1; }
+	if(!o.secret && !o.secret_file) { dolog("--secret or --secret-file is required\n"); return 1; }
+	if(!o.admin_addr) { dolog("--admin is required\n"); return 1; }
+	if(strcmp(o.mode, "server") == 0 && !o.public_addr) { dolog("--public is required in server mode\n"); return 1; }
+	if(strcmp(o.mode, "client") == 0 && !o.local_addr) { dolog("--local is required in client mode\n"); return 1; }
+	if(o.timeout_s) {
 		char *end = 0;
-		long v = strtol(timeout_s, &end, 10);
-		if(!end || *end || end == timeout_s || v < 0) {
-			dolog("bad --timeout value: %s\n", timeout_s);
+		long v = strtol(o.timeout_s, &end, 10);
+		if(!end || *end || end == o.timeout_s || v < 0) {
+			dolog("bad --timeout value: %s\n", o.timeout_s);
 			return 1;
 		}
 		g_timeout = v;
 	}
-	if(secret_file) {
-		if(read_secret_file(secret_file) < 0) return 1;
+	if(o.secret_file) {
+		if(read_secret_file(o.secret_file) < 0) return 1;
 	} else {
-		/* secret is a strdup() copy from parsing; keep it for
-		   process lifetime. Shell history and the exec race
-		   window remain for --secret; prefer --secret-file. */
-		g_secret = secret;
-		g_secret_len = strlen(secret);
+		/* The strdup() copy lives for the process lifetime. Shell
+		   history and the exec race window remain for --secret;
+		   prefer --secret-file. */
+		g_secret = o.secret;
+		g_secret_len = strlen(o.secret);
 	}
-	if(silent_argv) {
-		/* Clear all argv strings for stealth (ps aux). Note:
-		   the kernel already exposed them at exec time; this
-		   only helps against later inspection, not the race
-		   window. Prefer --secret-file and --server-key.
-		   Options were strdup()ed during parsing, so argv[]
-		   can be cleared safely now. */
-		for(i=1;i<argc;i++) {
-			size_t n = strlen(argv[i]);
-			memset(argv[i], 0, n);
-		}
-		if(argv[0][0] == '.' && argv[0][1] == '/') {
-			/* ./natsrv -> natsrv, so ps shows a bare name */
-			size_t n = strlen(argv[0]) - 2;
-			size_t k;
-			for(k=0;k<n;k++) argv[0][k] = argv[0][k+2];
-			argv[0][n] = 0;
-			argv[0][n+1] = 0;
-		}
-	}
-	if(allow_clear >= 0) g_allow_cleartext = allow_clear;
-	/* Key requirements: server needs signing key; client needs pin. */
-	if(strcmp(mode, "server") == 0) {
-		if(!server_key) { dolog("server mode requires --server-key FILE (see --genkey)\n"); return 1; }
-		if(load_server_key(server_key) < 0) return 1;
-	} else if(strcmp(mode, "client") == 0) {
-		if(!server_pubkey) { dolog("client mode requires --server-pubkey HEX\n"); return 1; }
-		if(hex_parse(server_pubkey, g_pinned_pk, 32) < 0) { dolog("bad --server-pubkey hex\n"); return 1; }
-		g_have_pin = 1;
-	}
+	if(o.silent_argv) hide_argv(argc, argv);
+	if(o.allow_clear >= 0) g_allow_cleartext = o.allow_clear;
 	signal(SIGPIPE, SIG_IGN);
-	char admin_ip[256];
-	unsigned short admin_port;
-	if(parse_ip_port(admin_addr, admin_ip, sizeof admin_ip, &admin_port) < 0) {
-		dolog("bad --admin address: %s\n", admin_addr);
-		return 1;
+	if(strcmp(o.mode, "server") == 0) {
+		char admin_ip[256], public_ip[256];
+		unsigned short admin_port, public_port;
+		if(!o.server_key) { dolog("server mode requires --server-key FILE (see --genkey)\n"); return 1; }
+		if(load_server_key(o.server_key) < 0) return 1;
+		if(opt_addr(o.admin_addr, "admin", admin_ip, sizeof admin_ip, &admin_port) < 0) return 1;
+		if(opt_addr(o.public_addr, "public", public_ip, sizeof public_ip, &public_port) < 0) return 1;
+		server_doit(admin_ip, admin_port, public_ip, public_port);
+		return 0;
 	}
-	if(strcmp(mode, "server") == 0) {
-		char client_ip[256];
-		unsigned short client_port;
-		if(parse_ip_port(public_addr, client_ip, sizeof client_ip, &client_port) < 0) {
-			dolog("bad --public address: %s\n", public_addr);
-			return 1;
-		}
-		server_doit(admin_ip, admin_port, client_ip, client_port);
-	} else if(strcmp(mode, "client") == 0) {
-		char local_ip[256];
-		unsigned short local_port;
-		if(parse_ip_port(local_addr, local_ip, sizeof local_ip, &local_port) < 0) {
-			dolog("bad --local address: %s\n", local_addr);
-			return 1;
-		}
+	if(strcmp(o.mode, "client") == 0) {
+		char admin_ip[256], local_ip[256];
+		unsigned short admin_port, local_port;
+		if(!o.server_pubkey) { dolog("client mode requires --server-pubkey HEX\n"); return 1; }
+		if(hex_parse(o.server_pubkey, g_pinned_pk, 32) < 0) { dolog("bad --server-pubkey hex\n"); return 1; }
+			if(opt_addr(o.admin_addr, "admin", admin_ip, sizeof admin_ip, &admin_port) < 0) return 1;
+		if(opt_addr(o.local_addr, "local", local_ip, sizeof local_ip, &local_port) < 0) return 1;
 		client_doit(admin_ip, admin_port, local_ip, local_port);
-	} else {
-		dolog("bad --mode: %s (server or client)\n", mode);
-		return 1;
+		return 0;
 	}
-	return 0;
+	dolog("bad --mode: %s (server or client)\n", o.mode);
+	return 1;
 }
