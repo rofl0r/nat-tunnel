@@ -486,12 +486,6 @@ union sockaddr_union {
 	struct sockaddr_in6 v6;
 };
 
-static int resolve_any(const char *host, unsigned short port, int passive, struct addrinfo **out) {
-	/* resolve_host() handles numeric literals too: getaddrinfo
-	   parses them without DNS. */
-	return resolve_host(host, port, passive, out);
-}
-
 /* Pick the best addrinfo: first v4 wins, otherwise first v6.
    This keeps v4 preferred for host names while allowing v6. */
 static struct addrinfo *pick_best(struct addrinfo *ai) {
@@ -531,7 +525,7 @@ static int connect_to(const char *host, unsigned short port) {
 		return fd;
 	}
 	struct addrinfo *ai = 0;
-	if(resolve_any(host, port, 0, &ai) < 0) return -1;
+	if(resolve_host(host, port, 0, &ai) < 0) return -1;
 	struct addrinfo *order[2];
 	addr_order(ai, order);
 	int fd = -1;
@@ -551,7 +545,7 @@ static int connect_to(const char *host, unsigned short port) {
 
 static int listen_on(const char *host, unsigned short port) {
 	struct addrinfo *ai = 0;
-	if(resolve_any(host, port, 1, &ai) < 0) return -1;
+	if(resolve_host(host, port, 1, &ai) < 0) return -1;
 	struct addrinfo *sel = pick_best(ai);
 	if(!sel) { freeaddrinfo(ai); return -1; }
 	int fd = socket(sel->ai_family, sel->ai_socktype, sel->ai_protocol);
