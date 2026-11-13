@@ -145,6 +145,24 @@ reaches a tunnel. Readable data alone is not treated as
 death on a spare that is about to be paired, since tunnel
 bytes can legitimately be in flight.
 
+Logging
+-------
+All console output goes to stderr, through one dprintf()
+call per line (macro dolog, ported from microsocks
+sockssrv.c). stderr is not line buffered, and dprintf
+writes straight to the fd. Neither needs a stdio lock,
+so dolog is safe from any thread and no fflush is
+needed after a line. Direct the log with 2> file.
+
+The timestamp is part of the same dprintf call as the
+message. Concurrent handshakes therefore never
+interleave inside a line. Only the main thread prints
+in practice, so the order stays readable.
+
+Help text (--help) is the answer to a CLI call and goes
+to stdout. Everything else, including --genkey output,
+goes to stderr.
+
 Admin socket peers
 ------------------
 Every peer that connects to the admin port gets a server

@@ -33,6 +33,15 @@
    OS, whose biggest stack user is getaddrinfo in libc. */
 #define THREAD_STACK_SIZE (64*1024)
 
+/* Ported from microsocks sockssrv.c. We log to stderr because
+   it is not line buffered: line buffering means malloc, and
+   malloc needs a lock in a multithreaded program. dprintf()
+   writes directly to the fd, so it needs no stdio lock either
+   and is safe from any thread. Every line therefore needs no
+   fflush(). Keep printing to the main thread where possible,
+   so the output stays well ordered. */
+#define dolog(...) dprintf(2, __VA_ARGS__)
+
 static const char *g_secret;
 static size_t g_secret_len;
 static char g_secret_buf[4096];
@@ -115,14 +124,15 @@ static void kill_sock(int fd) {
 	close(fd);
 }
 
-static void print_timestamp(void) {
+/* Timestamp prefix in a caller supplied buffer, for dolog().
+   A prefix and its message must go out in one dprintf() call,
+   so no other thread can interleave a line between them. */
+static const char *ts_prefix(char *buf, size_t cap) {
 	time_t t = time(NULL);
 	struct tm tmv;
 	localtime_r(&t, &tmv);
-	char buf[64];
-	size_t n = strftime(buf, sizeof buf, "[%Y-%m-%d %H:%M:%S] ", &tmv);
-	if(n) fwrite(buf, 1, n, stdout);
-	fflush(stdout);
+	if(strftime(buf, cap, "[%Y-%m-%d %H:%M:%S] ", &tmv) == 0) buf[0] = 0;
+	return buf;
 }
 
 /* Single RNG entry point for the whole file. get_nonce() for
@@ -133,17 +143,17 @@ static void rng_fill(unsigned char *buf, size_t n) {
 #ifdef HAVE_GETRANDOM
 	while(got < n) {
 		ssize_t r = getrandom(buf+got, n-got, 0);
-		if(r < 0) { if(errno == EINTR) continue; perror("getrandom"); exit(1); }
+		if(r < 0) { if(errno == EINTR) continue; dolog("getrandom: %s\n", strerror(errno)); exit(1); }
 		if(r == 0) break;
 		got += (size_t)r;
 	}
-	if(got != n) { fprintf(stderr, "getrandom short read\n"); exit(1); }
+	if(got != n) { dolog("getrandom short read\n"); exit(1); }
 #else
 	int fd = open("/dev/urandom", 0);
-	if(fd < 0) { perror("open /dev/urandom"); exit(1); }
+	if(fd < 0) { dolog("open /dev/urandom: %s\n", strerror(errno)); exit(1); }
 	while(got < n) {
 		ssize_t r = read(fd, buf+got, n-got);
-		if(r <= 0) { perror("read /dev/urandom"); exit(1); }
+		if(r <= 0) { dolog("read /dev/urandom: %s\n", strerror(errno)); exit(1); }
 		got += (size_t)r;
 	}
 	close(fd);
@@ -338,19 +348,19 @@ static int g_allow_cleartext = 0; /* encrypted by default */
 
 static int load_server_key(const char *path) {
 	int fd = open(path, 0);
-	if(fd < 0) { perror(path); return -1; }
+	if(fd < 0) { dolog("%s: %s\n", path, strerror(errno)); return -1; }
 	char pkhex[65];
 	unsigned char sk[64];
 	ssize_t n = read(fd, pkhex, 64);
-	if(n != 64) { fprintf(stderr, "bad key file (need 64 hex pk chars)\n"); return -1; }
+	if(n != 64) { dolog("bad key file (need 64 hex pk chars)\n"); return -1; }
 	pkhex[64] = 0;
-	if(hex_parse(pkhex, g_server_pk, 32) < 0) { fprintf(stderr, "bad pk hex in key file\n"); return -1; }
+	if(hex_parse(pkhex, g_server_pk, 32) < 0) { dolog("bad pk hex in key file\n"); return -1; }
 	/* skip newline after pk line (legacy files may lack it) */
 	{
 		char c;
 		if(read(fd, &c, 1) == 1 && c != '\n' && c != '\r') {
 			sk[0] = (unsigned char)c;
-			if(read(fd, sk+1, 63) != 63) { fprintf(stderr, "short sk\n"); return -1; }
+			if(read(fd, sk+1, 63) != 63) { dolog("short sk\n"); return -1; }
 			goto sk_done;
 		}
 	}
@@ -376,7 +386,7 @@ static int load_server_key(const char *path) {
 		} else if(n > 64) {
 			memcpy(sk, peek, 64);
 		} else {
-			fprintf(stderr, "short sk in key file\n"); return -1;
+			dolog("short sk in key file\n"); return -1;
 		}
 	}
 sk_done:
@@ -389,13 +399,13 @@ sk_done:
 
 static void x25519_base(unsigned char *out, const unsigned char *sk) {
 	if(NCRYPT_SCALARMULT_BASE(out, sk) != 0) {
-		fprintf(stderr, "crypto_scalarmult_base failed\n");
+		dolog("crypto_scalarmult_base failed\n");
 		exit(1);
 	}
 }
 static void x25519_mul(unsigned char *out, const unsigned char *sk, const unsigned char *pk) {
 	if(NCRYPT_SCALARMULT(out, sk, pk) != 0) {
-		fprintf(stderr, "crypto_scalarmult failed (bad peer key)\n");
+		dolog("crypto_scalarmult failed (bad peer key)\n");
 		exit(1);
 	}
 }
@@ -768,24 +778,24 @@ static void tun_init_from(const unsigned char *shared, const unsigned char *thas
 
 static int client_setup_sock(const char *upstream_ip, unsigned short upstream_port, unsigned char req) {
 	int fd = connect_to(upstream_ip, upstream_port);
-	if(fd < 0) { perror("connect upstream"); return -1; }
+	if(fd < 0) { dolog("connect upstream: %s\n", strerror(errno)); return -1; }
 	/* recv SERVER_HELLO frame */
 	unsigned char ftype;
 	unsigned char payload[MAX_FRAME];
 	size_t plen = 0;
 	if(recv_frame(fd, &ftype, payload, MAX_FRAME, &plen) < 0 || ftype != FT_SH || plen != 117) {
-		fprintf(stderr, "bad server hello\n");
+		dolog("bad server hello\n");
 		close(fd); return -1;
 	}
 	const unsigned char *sh_payload = payload;
-	if(memcmp(sh_payload, NT_MAGIC, 4) != 0) { fprintf(stderr, "bad magic\n"); close(fd); return -1; }
+	if(memcmp(sh_payload, NT_MAGIC, 4) != 0) { dolog("bad magic\n"); close(fd); return -1; }
 	const unsigned char *eph_s = sh_payload + 4;
 	unsigned char cap = sh_payload[36];
 	const unsigned char *nonce = sh_payload + 37;
 	const unsigned char *sig = sh_payload + 53;
 	/* verify signature over MAGIC+eph_s+cap+nonce (53 bytes) */
 	if(ed_verify(sig, sh_payload, 53) != 0) {
-		fprintf(stderr, "server signature verify failed\n");
+		dolog("server signature verify failed\n");
 		send_error_close(fd, 2);
 		close(fd); return -1;
 	}
@@ -849,6 +859,7 @@ retry:
 static void client_doit(const char *upstream_ip, unsigned short upstream_port, const char *local_ip, unsigned short local_port) {
 	int control = -1;
 	int next = -1;
+	char tsbuf[64];
 	struct tunnel **threads = 0;
 	size_t nthreads = 0, capthreads = 0;
 	client_reconnect(upstream_ip, upstream_port, &control, &next);
@@ -873,8 +884,7 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 				   instead of waiting for a CONN that the server
 				   cannot send while it has no spare. */
 				if(!spare_alive(next)) {
-					printf("spare socket dead, re-arming\n");
-					fflush(stdout);
+					dolog("%sspare socket dead, re-arming\n", ts_prefix(tsbuf, sizeof tsbuf));
 					next = arm_spare(upstream_ip, upstream_port, next);
 					if(next < 0) goto lost_control;
 				}
@@ -883,8 +893,7 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 			if(fds[1].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) {
 				/* Readable or errored: the spare is unusable.
 				   RST it, so the server drops its side now. */
-				printf("spare socket dead, re-arming\n");
-				fflush(stdout);
+				dolog("%sspare socket dead, re-arming\n", ts_prefix(tsbuf, sizeof tsbuf));
 				kill_sock(next);
 				next = client_setup_sock(upstream_ip, upstream_port, 2);
 				if(next < 0) goto lost_control;
@@ -901,10 +910,7 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 			if(ftype != FT_CTRL) continue;
 			ctr_crypt(&g_ctl_dn, line, linelen);
 			line[linelen] = 0;
-			print_timestamp();
-			fputs((char*)line, stdout);
-			fputc('\n', stdout);
-			fflush(stdout);
+			dolog("%s%s\n", ts_prefix(tsbuf, sizeof tsbuf), (char*)line);
 			if(strncmp((char*)line, "CONN:", 5) != 0) continue;
 			{
 				/* Parse CONN:ip:port or CONN:[v6]:port.
@@ -921,8 +927,7 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 					*colon = 0;
 				}
 				if(!spare_alive(next)) {
-					printf("spare socket dead, re-arming\n");
-					fflush(stdout);
+					dolog("%sspare socket dead, re-arming\n", ts_prefix(tsbuf, sizeof tsbuf));
 					next = arm_spare(upstream_ip, upstream_port, next);
 					if(next < 0) goto lost_control;
 					continue;
@@ -930,7 +935,7 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 				{
 					int local = connect_to(local_ip, local_port);
 					if(local < 0) {
-						perror("connect local");
+						dolog("connect local: %s\n", strerror(errno));
 						/* Drop the paired spare: the server must
 						   see it gone, not keep it for a client
 						   that was never served. */
@@ -956,8 +961,7 @@ static void client_doit(const char *upstream_ip, unsigned short upstream_port, c
 lost_control:
 		/* Lost control: tear down control and spare, then
 		   re-handshake with backoff. Tunnels stay up. */
-		printf("lost control socket, reconnecting\n");
-		fflush(stdout);
+		dolog("%slost control socket, reconnecting\n", ts_prefix(tsbuf, sizeof tsbuf));
 		if(control >= 0) close(control);
 		if(next >= 0) kill_sock(next);
 		client_reconnect(upstream_ip, upstream_port, &control, &next);
@@ -999,32 +1003,36 @@ static void server_handshake(int conn, int *control, int *next_up, int *next_enc
 	sh[36] = cap;
 	memcpy(sh+37, nonce, 16);
 	if(ed_sign(sh+53, sh, 53) != 0) { kill_sock(conn); return; }
-	print_timestamp();
-	printf("CONN: %s ... ", addrstr);
-	fflush(stdout);
-	if(send_frame(conn, FT_SH, sh, 117) < 0) { printf("rejected!\n"); fflush(stdout); kill_sock(conn); return; }
+	/* One line per handshake outcome: the timestamp and the
+	   result go out in one dprintf(), so concurrent handshakes
+	   never interleave inside a line. */
+	char log_prefix[64];
+	ts_prefix(log_prefix, sizeof log_prefix);
+	if(send_frame(conn, FT_SH, sh, 117) < 0) {
+		dolog("%sCONN: %s ... rejected!\n", log_prefix, addrstr);
+		kill_sock(conn);
+		return;
+	}
 	/* The only blocking read: a peer that never sends a client
 	   hello is killed after HELLO_WAIT_MS. */
 	unsigned char ftype;
 	unsigned char ch[65];
 	size_t plen = 0;
 	if(wait_frame(conn, HELLO_WAIT_MS, &ftype, ch, 65, &plen) != 0 || ftype != FT_CH || plen != 65) {
-		printf("rejected!\n");
-		fflush(stdout);
+		dolog("%sCONN: %s ... rejected!\n", log_prefix, addrstr);
 		kill_sock(conn);
 		return;
 	}
 	const unsigned char *eph_c = ch;
 	unsigned char req = ch[32];
 	const unsigned char *mac = ch + 33;
-	if(req > 2) { printf("rejected!\n"); fflush(stdout); kill_sock(conn); return; }
+	if(req > 2) { dolog("%sCONN: %s ... rejected!\n", log_prefix, addrstr); kill_sock(conn); return; }
 	unsigned char shared[32], thash[32], expect_mac[32];
 	x25519_mul(shared, eph_sk, eph_c);
 	transcript_hash(eph_pk, eph_c, cap, nonce, req, thash);
 	auth_mac(shared, thash, req, expect_mac);
 	if(!ct_equal((char*)mac, (char*)expect_mac, 32)) {
-		printf("rejected!\n");
-		fflush(stdout);
+		dolog("%sCONN: %s ... rejected!\n", log_prefix, addrstr);
 		kill_sock(conn);
 		return;
 	}
@@ -1041,34 +1049,33 @@ static void server_handshake(int conn, int *control, int *next_up, int *next_enc
 		/* Reaching here means the peer holds the shared secret,
 		   so a takeover of a live control socket is the real
 		   client restarting. A port scanner cannot get here. */
-		if(*control >= 0) { printf("control takeover\n"); close(*control); }
+		if(*control >= 0) { dolog("%scontrol takeover\n", log_prefix); close(*control); }
 		if(*next_up >= 0) { kill_sock(*next_up); *next_up = -1; }
 		*control = conn;
 		ctl_init_from(shared, thash);
-		printf("OK (admin)\n");
+		dolog("%sCONN: %s ... OK (admin)\n", log_prefix, addrstr);
 	} else {
 		int enc = (req == 2);
 		if(!enc && !g_allow_cleartext) {
-			printf("rejected cleartext not allowed\n");
-			fflush(stdout);
+			dolog("%sCONN: %s ... rejected cleartext not allowed\n", log_prefix, addrstr);
 			kill_sock(conn);
 			memset(shared, 0, sizeof shared);
 			return;
 		}
-		printf("OK (tunnel%s)\n", enc ? " enc" : "");
+		dolog("%sCONN: %s ... OK (tunnel%s)\n", log_prefix, addrstr, enc ? " enc" : "");
 		if(*next_up >= 0) kill_sock(*next_up);
 		*next_up = conn;
 		*next_enc = enc;
 		tun_init_from(shared, thash);
 	}
 	memset(shared, 0, sizeof shared);
-	fflush(stdout);
 }
 
 /* Pair a live spare with a public connection and hand both to a
    tunnel thread. */
 static void accept_public(int sc, int *control, int *next_up, int *next_enc, struct tunnel ***threads, size_t *nthreads, size_t *capthreads) {
 	union sockaddr_union addr;
+	char tsbuf[64];
 	socklen_t alen = sizeof addr;
 	int conn = accept(sc, (struct sockaddr*)&addr, &alen);
 	if(conn < 0) return;
@@ -1078,9 +1085,7 @@ static void accept_public(int sc, int *control, int *next_up, int *next_enc, str
 		/* Never pair a dead spare: the public peer would hang on
 		   a tunnel that never opens. Reset it at once instead. */
 		if(*next_up >= 0) { kill_sock(*next_up); *next_up = -1; }
-		print_timestamp();
-		printf("CONN: %s refused, no spare\n", addrstr);
-		fflush(stdout);
+		dolog("%sCONN: %s refused, no spare\n", ts_prefix(tsbuf, sizeof tsbuf), addrstr);
 		kill_sock(conn);
 		return;
 	}
@@ -1091,8 +1096,7 @@ static void accept_public(int sc, int *control, int *next_up, int *next_enc, str
 		if(mlen > (int)sizeof msg) mlen = sizeof msg;
 		ctr_crypt(&g_ctl_dn, msg, (size_t)mlen); /* control is server->client only: both ends use dn stream */
 		if(send_frame(*control, FT_CTRL, msg, (size_t)mlen) < 0) {
-			printf("lost control socket\n");
-			fflush(stdout);
+			dolog("%slost control socket\n", ts_prefix(tsbuf, sizeof tsbuf));
 			close(*control);
 			*control = -1;
 			kill_sock(*next_up);
@@ -1112,12 +1116,13 @@ static void accept_public(int sc, int *control, int *next_up, int *next_enc, str
 
 static void server_doit(const char *up_ip, unsigned short up_port, const char *client_ip, unsigned short client_port) {
 	int su = listen_on(up_ip, up_port);
-	if(su < 0) { perror("listen admin"); return; }
+	if(su < 0) { dolog("listen admin: %s\n", strerror(errno)); return; }
 	int sc = listen_on(client_ip, client_port);
-	if(sc < 0) { perror("listen public"); return; }
+	if(sc < 0) { dolog("listen public: %s\n", strerror(errno)); return; }
 	int control = -1;
 	int next_up = -1;
 	int next_enc = 0;
+	char tsbuf[64];
 	struct tunnel **threads = 0;
 	size_t nthreads = 0, capthreads = 0;
 	while(1) {
@@ -1137,15 +1142,13 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 		   so a peer that arrives at the same moment never
 		   replaces a live control socket. */
 		if(fds[2].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) {
-			printf("lost control socket\n");
-			fflush(stdout);
+			dolog("%slost control socket\n", ts_prefix(tsbuf, sizeof tsbuf));
 			if(control >= 0) close(control);
 			control = -1;
 			continue;
 		}
 		if(fds[3].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) {
-			printf("lost spare upstream socket\n");
-			fflush(stdout);
+			dolog("%slost spare upstream socket\n", ts_prefix(tsbuf, sizeof tsbuf));
 			kill_sock(next_up);
 			next_up = -1;
 			continue;
@@ -1165,6 +1168,9 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 		}
 	}
 }
+
+/* Help text goes to stdout: it is the answer to a CLI call,
+   not a log line. All runtime output uses dolog(). */
 static void usage(const char *prog) {
 	printf(
 		"usage: %s [options]\n"
@@ -1197,15 +1203,15 @@ static void usage(const char *prog) {
 }
 static int read_secret_file(const char *path) {
 	int fd = open(path, 0);
-	if(fd < 0) { perror(path); return -1; }
+	if(fd < 0) { dolog("%s: %s\n", path, strerror(errno)); return -1; }
 	ssize_t n = read(fd, g_secret_buf, sizeof g_secret_buf - 1);
 	close(fd);
-	if(n <= 0) { fprintf(stderr, "empty secret file: %s\n", path); return -1; }
-	if(n == (ssize_t)(sizeof g_secret_buf - 1)) { fprintf(stderr, "secret file too long: %s\n", path); return -1; }
+	if(n <= 0) { dolog("empty secret file: %s\n", path); return -1; }
+	if(n == (ssize_t)(sizeof g_secret_buf - 1)) { dolog("secret file too long: %s\n", path); return -1; }
 	g_secret_buf[n] = 0;
 	/* strip one trailing newline/CRLF like a text file */
 	while(n > 0 && (g_secret_buf[n-1] == '\n' || g_secret_buf[n-1] == '\r')) g_secret_buf[--n] = 0;
-	if(n == 0) { fprintf(stderr, "empty secret in file: %s\n", path); return -1; }
+	if(n == 0) { dolog("empty secret in file: %s\n", path); return -1; }
 	g_secret = g_secret_buf;
 	g_secret_len = (size_t)n;
 	g_secret_from_file = 1;
@@ -1225,21 +1231,21 @@ static int hex_parse(const char *hex, unsigned char *out, size_t outlen) {
 
 static int do_genkey(const char *outpath) {
 	unsigned char pk[32], sk[64];
-	if(NCRYPT_SIGN_KEYPAIR(pk, sk) != 0) { fprintf(stderr, "crypto_sign_keypair failed\n"); return 1; }
+	if(NCRYPT_SIGN_KEYPAIR(pk, sk) != 0) { dolog("crypto_sign_keypair failed\n"); return 1; }
 	int fd = open(outpath, 1|64|512, 0600);
-	if(fd < 0) { perror(outpath); return 1; }
+	if(fd < 0) { dolog("%s: %s\n", outpath, strerror(errno)); return 1; }
 	/* file format: hex pk + newline + hex sk + newline, for pinning */
 	char buf[200];
 	int m = snprintf(buf, sizeof buf, "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
 		pk[0],pk[1],pk[2],pk[3],pk[4],pk[5],pk[6],pk[7],pk[8],pk[9],pk[10],pk[11],pk[12],pk[13],pk[14],pk[15],pk[16],pk[17],pk[18],pk[19],pk[20],pk[21],pk[22],pk[23],pk[24],pk[25],pk[26],pk[27],pk[28],pk[29],pk[30],pk[31]);
-	if(m <= 0 || write(fd, buf, (size_t)m) != m) { perror("write key"); return 1; }
+	if(m <= 0 || write(fd, buf, (size_t)m) != m) { dolog("write key: %s\n", strerror(errno)); return 1; }
 	{
 		char hexsk[129];
 		int i;
 		for(i=0;i<64;i++) snprintf(hexsk+2*i, 3, "%02x", sk[i]);
 		hexsk[128] = 0;
-		if(write(fd, hexsk, 128) != 128) { perror("write key"); return 1; }
-		if(write(fd, "\n", 1) != 1) { perror("write key"); return 1; }
+		if(write(fd, hexsk, 128) != 128) { dolog("write key: %s\n", strerror(errno)); return 1; }
+		if(write(fd, "\n", 1) != 1) { dolog("write key: %s\n", strerror(errno)); return 1; }
 	}
 	close(fd);
 	{
@@ -1247,9 +1253,9 @@ static int do_genkey(const char *outpath) {
 		int i;
 		for(i=0;i<32;i++) snprintf(hexpk+2*i, 3, "%02x", pk[i]);
 		hexpk[64] = 0;
-		printf("public key: %s\n", hexpk);
-		printf("private key written to %s (0600)\n", outpath);
-		printf("pin the public key on the peer with the matching hex string\n");
+		dolog("public key: %s\n", hexpk);
+		dolog("private key written to %s (0600)\n", outpath);
+		dolog("pin the public key on the peer with the matching hex string\n");
 	}
 	memset(sk, 0, sizeof sk);
 	return 0;
@@ -1304,10 +1310,10 @@ int main(int argc, char **argv) {
 		const char *outpath = 0;
 		int i;
 		for(i=2;i<argc;i++) {
-			if(outpath) { fprintf(stderr, "unrecognized argument: %s\n", argv[i]); return 1; }
+			if(outpath) { dolog("unrecognized argument: %s\n", argv[i]); return 1; }
 			else outpath = argv[i];
 		}
-		if(!outpath) { fprintf(stderr, "--genkey requires a filename: --genkey FILENAME\n"); return 1; }
+		if(!outpath) { dolog("--genkey requires a filename: --genkey FILENAME\n"); return 1; }
 		return do_genkey(outpath);
 	}
 	if(argc < 2 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
@@ -1351,19 +1357,19 @@ int main(int argc, char **argv) {
 		else if(strncmp(argv[i], "--server-key=", 13) == 0) server_key = strdup(argv[i]+13);
 		else if(strncmp(argv[i], "--server-pubkey=", 16) == 0) server_pubkey = strdup(argv[i]+16);
 		else {
-			fprintf(stderr, "unrecognized argument: %s\n", argv[i]);
+			dolog("unrecognized argument: %s\n", argv[i]);
 			return 1;
 		}
 	}
 	if(secret && secret_file) {
-		fprintf(stderr, "--secret and --secret-file are mutually exclusive\n");
+		dolog("--secret and --secret-file are mutually exclusive\n");
 		return 1;
 	}
-	if(!mode) { fprintf(stderr, "--mode is required (server or client)\n"); return 1; }
-	if(!secret && !secret_file) { fprintf(stderr, "--secret or --secret-file is required\n"); return 1; }
-	if(!admin_addr) { fprintf(stderr, "--admin is required\n"); return 1; }
-	if(strcmp(mode, "server") == 0 && !public_addr) { fprintf(stderr, "--public is required in server mode\n"); return 1; }
-	if(strcmp(mode, "client") == 0 && !local_addr) { fprintf(stderr, "--local is required in client mode\n"); return 1; }
+	if(!mode) { dolog("--mode is required (server or client)\n"); return 1; }
+	if(!secret && !secret_file) { dolog("--secret or --secret-file is required\n"); return 1; }
+	if(!admin_addr) { dolog("--admin is required\n"); return 1; }
+	if(strcmp(mode, "server") == 0 && !public_addr) { dolog("--public is required in server mode\n"); return 1; }
+	if(strcmp(mode, "client") == 0 && !local_addr) { dolog("--local is required in client mode\n"); return 1; }
 	if(!public_addr) public_addr = "0.0.0.0:8080";
 	if(!local_addr) local_addr = "localhost:80";
 	if(!admin_addr) admin_addr = "0.0.0.0:8081";
@@ -1371,7 +1377,7 @@ int main(int argc, char **argv) {
 		char *end = 0;
 		long v = strtol(timeout_s, &end, 10);
 		if(!end || *end || end == timeout_s || v < 0) {
-			fprintf(stderr, "bad --timeout value: %s\n", timeout_s);
+			dolog("bad --timeout value: %s\n", timeout_s);
 			return 1;
 		}
 		g_timeout = v;
@@ -1408,25 +1414,25 @@ int main(int argc, char **argv) {
 	if(allow_clear >= 0) g_allow_cleartext = allow_clear;
 	/* Key requirements: server needs signing key; client needs pin. */
 	if(strcmp(mode, "server") == 0) {
-		if(!server_key) { fprintf(stderr, "server mode requires --server-key FILE (see --genkey)\n"); return 1; }
+		if(!server_key) { dolog("server mode requires --server-key FILE (see --genkey)\n"); return 1; }
 		if(load_server_key(server_key) < 0) return 1;
 	} else if(strcmp(mode, "client") == 0) {
-		if(!server_pubkey) { fprintf(stderr, "client mode requires --server-pubkey HEX\n"); return 1; }
-		if(hex_parse(server_pubkey, g_pinned_pk, 32) < 0) { fprintf(stderr, "bad --server-pubkey hex\n"); return 1; }
+		if(!server_pubkey) { dolog("client mode requires --server-pubkey HEX\n"); return 1; }
+		if(hex_parse(server_pubkey, g_pinned_pk, 32) < 0) { dolog("bad --server-pubkey hex\n"); return 1; }
 		g_have_pin = 1;
 	}
 	signal(SIGPIPE, SIG_IGN);
 	char admin_ip[256];
 	unsigned short admin_port;
 	if(parse_ip_port(admin_addr, admin_ip, sizeof admin_ip, &admin_port) < 0) {
-		fprintf(stderr, "bad --admin address: %s\n", admin_addr);
+		dolog("bad --admin address: %s\n", admin_addr);
 		return 1;
 	}
 	if(strcmp(mode, "server") == 0) {
 		char client_ip[256];
 		unsigned short client_port;
 		if(parse_ip_port(public_addr, client_ip, sizeof client_ip, &client_port) < 0) {
-			fprintf(stderr, "bad --public address: %s\n", public_addr);
+			dolog("bad --public address: %s\n", public_addr);
 			return 1;
 		}
 		server_doit(admin_ip, admin_port, client_ip, client_port);
@@ -1434,12 +1440,12 @@ int main(int argc, char **argv) {
 		char local_ip[256];
 		unsigned short local_port;
 		if(parse_ip_port(local_addr, local_ip, sizeof local_ip, &local_port) < 0) {
-			fprintf(stderr, "bad --local address: %s\n", local_addr);
+			dolog("bad --local address: %s\n", local_addr);
 			return 1;
 		}
 		client_doit(admin_ip, admin_port, local_ip, local_port);
 	} else {
-		fprintf(stderr, "bad --mode: %s (server or client)\n", mode);
+		dolog("bad --mode: %s (server or client)\n", mode);
 		return 1;
 	}
 	return 0;
