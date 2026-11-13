@@ -83,6 +83,38 @@ static int spare_alive(int fd) {
 	return 1;
 }
 
+static int recv_frame(int fd, unsigned char *type, unsigned char *payload, size_t cap, size_t *out_len);
+/* Wait up to timeout_ms for a readable first byte, then read one
+   frame. Returns 0 on a frame, -1 on end of socket, -2 on timeout,
+   -3 on an over-long frame. The control socket must never use
+   SO_RCVTIMEO, so this poll is the only idle wait on it. */
+static int wait_frame(int fd, int timeout_ms, unsigned char *type, unsigned char *payload, size_t cap, size_t *out_len) {
+	struct pollfd pfd;
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+	int r;
+	do { r = poll(&pfd, 1, timeout_ms); } while(r < 0 && errno == EINTR);
+	if(r == 0) return -2;
+	if(r < 0) return -1;
+	if(pfd.revents & (POLLERR|POLLHUP|POLLNVAL)) {
+		/* Hangup: data may still be buffered, read it first. */
+		if(!(pfd.revents & POLLIN)) return -1;
+	}
+	return recv_frame(fd, type, payload, cap, out_len);
+}
+
+/* Kill a socket dead without flushing: RST on the wire, so the peer
+   drops it at once instead of after a timeout. Used for sockets
+   that must never become the control or the spare socket. */
+static void kill_sock(int fd) {
+	struct linger lg;
+	lg.l_onoff = 1;
+	lg.l_linger = 0;
+	setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+	close(fd);
+}
+
 static void print_timestamp(void) {
 	time_t t = time(NULL);
 	struct tm tmv;
@@ -260,6 +292,9 @@ static int recv_exact(int fd, void *buf, size_t len) {
 #define FT_TUNNEL 4
 #define FT_ERROR 5
 #define FT_CLOSE 6
+/* Client loop tick: re-check the spare socket, so a spare that
+   died does not wait for a CONN that can never arrive. */
+#define SPARE_TICK_MS 5000
 #define NT_MAGIC "NT02"
 #define MAX_FRAME 65535
 
@@ -779,106 +814,179 @@ static int client_setup_sock(const char *upstream_ip, unsigned short upstream_po
 	return fd;
 }
 
+/* Arm a fresh spare socket, closing the old one first. The spare
+   is a raw stream socket that the server pairs with the next
+   public connection. It must never hold unread data: a readable
+   spare means it is gone, since only the server writes to it and
+   only after pairing. */
+static int arm_spare(const char *upstream_ip, unsigned short upstream_port, int old) {
+	if(old >= 0) kill_sock(old);
+	return client_setup_sock(upstream_ip, upstream_port, 2);
+}
+
+/* Handshake control and spare. Retry every 2s until both are up.
+   An attempt starts at once, so a restart recovers fast and a
+   lost server only costs the poll interval. */
+static void client_reconnect(const char *upstream_ip, unsigned short upstream_port, int *control, int *next) {
+	*control = -1;
+	*next = -1;
+	while(*control < 0) {
+		*control = client_setup_sock(upstream_ip, upstream_port, 0);
+		if(*control < 0) goto retry;
+		*next = client_setup_sock(upstream_ip, upstream_port, 2);
+		if(*next < 0) { close(*control); *control = -1; goto retry; }
+		return;
+retry:
+		{
+			struct timespec ts;
+			ts.tv_sec = 2;
+			ts.tv_nsec = 0;
+			nanosleep(&ts, 0);
+		}
+	}
+}
+
 static void client_doit(const char *upstream_ip, unsigned short upstream_port, const char *local_ip, unsigned short local_port) {
-		int control = client_setup_sock(upstream_ip, upstream_port, 0);
-	if(control < 0) return;
-	int next = client_setup_sock(upstream_ip, upstream_port, 2);
-	if(next < 0) { close(control); return; }
+	int control = -1;
+	int next = -1;
 	struct tunnel **threads = 0;
 	size_t nthreads = 0, capthreads = 0;
+	client_reconnect(upstream_ip, upstream_port, &control, &next);
 	while(1) {
 		tunnel_reap(&threads, &nthreads);
-		unsigned char ftype;
-		unsigned char line[4096];
-		size_t linelen = 0;
-		if(recv_frame(control, &ftype, line, sizeof line, &linelen) < 0 || ftype == FT_ERROR || ftype == FT_CLOSE || !g_ctl_valid) {
-			/* Lost control (matches py fix): old C code broke out
-			   and exited, killing all tunnels. Tear down control+
-			   spare and re-handshake with backoff. */
-			printf("lost control socket, reconnecting\n");
-			fflush(stdout);
-			close(control);
-			if(next >= 0) close(next);
-			next = -1;
-			control = -1;
-			while(control < 0) {
-				struct timespec ts;
-				ts.tv_sec = 2;
-				ts.tv_nsec = 0;
-				nanosleep(&ts, 0);
-				control = client_setup_sock(upstream_ip, upstream_port, 0);
-				if(control < 0) continue;
-				next = client_setup_sock(upstream_ip, upstream_port, 2);
-				if(next < 0) { close(control); control = -1; }
-			}
-			continue;
+		/* The spare is re-armed before every wait, so a dead spare
+		   never blocks the client. */
+		if(next < 0) {
+			next = arm_spare(upstream_ip, upstream_port, next);
+			if(next < 0) goto lost_control;
 		}
-		if(ftype != FT_CTRL) continue;
-		ctr_crypt(&g_ctl_dn, line, linelen);
-		line[linelen] = 0;
-		print_timestamp();
-		fputs((char*)line, stdout);
-		fputc('\n', stdout);
-		fflush(stdout);
-		if(strncmp((char*)line, "CONN:", 5) == 0) {
-			/* Parse CONN:ip:port or CONN:[v6]:port (matches py fix).
-			   Address is unused beyond this in both programs. */
-			char *p = (char*)line + 5;
-			if(*p == '[') {
-				char *rb = strchr(p, ']');
-				if(!rb) continue;
-				*rb = 0;
-				if(!strchr(rb+1, ':')) continue;
-			} else {
-				char *colon = strchr(p, ':');
-				if(!colon) continue;
-				*colon = 0;
-			}
-			int local = connect_to(local_ip, local_port);
-			if(local < 0) {
-				perror("connect local");
-				/* Local fail (matches py fix): old C code kept the
-				   paired spare socket, stranding the public client
-				   that the server had paired with it. Drop the
-				   spare, arm a fresh one, and continue. */
-				if(next >= 0) close(next);
-				next = client_setup_sock(upstream_ip, upstream_port, 2);
+		{
+			struct pollfd fds[2];
+			int r;
+			fds[0].fd = control; fds[0].events = POLLIN; fds[0].revents = 0;
+			fds[1].fd = next; fds[1].events = POLLIN; fds[1].revents = 0;
+			do { r = poll(fds, 2, SPARE_TICK_MS); } while(r < 0 && errno == EINTR);
+			if(r < 0) goto lost_control;
+			if(r == 0) {
+				/* Tick: a spare that died silently (dropped NAT
+				   state, blackholed path) is replaced here,
+				   instead of waiting for a CONN that the server
+				   cannot send while it has no spare. */
+				if(!spare_alive(next)) {
+					printf("spare socket dead, re-arming\n");
+					fflush(stdout);
+					next = arm_spare(upstream_ip, upstream_port, next);
+					if(next < 0) goto lost_control;
+				}
 				continue;
 			}
-			if(!spare_alive(next)) {
+			if(fds[1].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) {
+				/* Readable or errored: the spare is unusable.
+				   RST it, so the server drops its side now. */
 				printf("spare socket dead, re-arming\n");
 				fflush(stdout);
-				close(next);
+				kill_sock(next);
 				next = client_setup_sock(upstream_ip, upstream_port, 2);
+				if(next < 0) goto lost_control;
 				continue;
 			}
-			if(tunnel_add(&threads, &nthreads, &capthreads, local, next, 1) < 0) {
-				close(local); close(next);
-				continue;
-			}
-			next = client_setup_sock(upstream_ip, upstream_port, 2);
-			if(next < 0) break;
+			if(fds[0].revents & (POLLERR|POLLHUP|POLLNVAL)) goto lost_control;
+			if(!(fds[0].revents & POLLIN)) continue;
 		}
+		{
+			unsigned char ftype;
+			unsigned char line[4096];
+			size_t linelen = 0;
+			if(recv_frame(control, &ftype, line, sizeof line, &linelen) < 0 || ftype == FT_ERROR || ftype == FT_CLOSE || !g_ctl_valid) goto lost_control;
+			if(ftype != FT_CTRL) continue;
+			ctr_crypt(&g_ctl_dn, line, linelen);
+			line[linelen] = 0;
+			print_timestamp();
+			fputs((char*)line, stdout);
+			fputc('\n', stdout);
+			fflush(stdout);
+			if(strncmp((char*)line, "CONN:", 5) != 0) continue;
+			{
+				/* Parse CONN:ip:port or CONN:[v6]:port.
+				   Address is unused beyond this in both programs. */
+				char *cp = (char*)line + 5;
+				if(*cp == '[') {
+					char *rb = strchr(cp, ']');
+					if(!rb) continue;
+					*rb = 0;
+					if(!strchr(rb+1, ':')) continue;
+				} else {
+					char *colon = strchr(cp, ':');
+					if(!colon) continue;
+					*colon = 0;
+				}
+				if(!spare_alive(next)) {
+					printf("spare socket dead, re-arming\n");
+					fflush(stdout);
+					next = arm_spare(upstream_ip, upstream_port, next);
+					if(next < 0) goto lost_control;
+					continue;
+				}
+				{
+					int local = connect_to(local_ip, local_port);
+					if(local < 0) {
+						perror("connect local");
+						/* Drop the paired spare: the server must
+						   see it gone, not keep it for a client
+						   that was never served. */
+						kill_sock(next);
+						next = client_setup_sock(upstream_ip, upstream_port, 2);
+						if(next < 0) goto lost_control;
+						continue;
+					}
+					if(tunnel_add(&threads, &nthreads, &capthreads, local, next, 1) < 0) {
+						kill_sock(next);
+						close(local);
+						next = client_setup_sock(upstream_ip, upstream_port, 2);
+						if(next < 0) goto lost_control;
+						continue;
+					}
+					/* next is owned by the tunnel thread now */
+					next = client_setup_sock(upstream_ip, upstream_port, 2);
+					if(next < 0) goto lost_control;
+				}
+			}
+		}
+		continue;
+lost_control:
+		/* Lost control: tear down control and spare, then
+		   re-handshake with backoff. Tunnels stay up. */
+		printf("lost control socket, reconnecting\n");
+		fflush(stdout);
+		if(control >= 0) close(control);
+		if(next >= 0) kill_sock(next);
+		client_reconnect(upstream_ip, upstream_port, &control, &next);
 	}
 }
 
 /* ---- NAT server ---- */
 
-static int server_wait_conn_up(int su, int *control, int *next_up, int *next_enc, char *next_nonce) {
-	(void)next_nonce;
-	union sockaddr_union addr;
-	socklen_t alen = sizeof addr;
-	int conn = accept(su, (struct sockaddr*)&addr, &alen);
-	if(conn < 0) return -1;
+/* Handshake deadline for an accepted peer, in milliseconds. A
+   real NT client answers SERVER_HELLO at once, so this only
+   bounds the wait for a port scanner that connects and stalls. */
+#define HELLO_WAIT_MS 1500
+
+/* Run the handshake on an already accepted socket. The caller
+   sorts out port scanners: a peer that is not the NT client
+   fails the MAC check and leaves the control socket untouched.
+   Only a peer that holds the shared secret can replace a live
+   control socket. */
+static void server_handshake(int conn, int *control, int *next_up, int *next_enc) {
 	{
 		struct timeval tv;
-		tv.tv_sec = 10;
+		tv.tv_sec = 5;
 		tv.tv_usec = 0;
-		setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+		setsockopt(conn, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 	}
-	char addrstr[64];
-	format_addr(&addr, addrstr, sizeof addrstr);
-	/* SERVER_HELLO: MAGIC + eph_pk + cap + nonce(16) + sig(64) = 117 */
+	union sockaddr_union addr;
+	socklen_t alen = sizeof addr;
+	char addrstr[64] = "?";
+	if(getpeername(conn, (struct sockaddr*)&addr, &alen) == 0) format_addr(&addr, addrstr, sizeof addrstr);
 	unsigned char eph_sk[32], eph_pk[32];
 	rng_fill(eph_sk, 32);
 	x25519_base(eph_pk, eph_sk);
@@ -890,61 +998,116 @@ static int server_wait_conn_up(int su, int *control, int *next_up, int *next_enc
 	memcpy(sh+4, eph_pk, 32);
 	sh[36] = cap;
 	memcpy(sh+37, nonce, 16);
-	if(ed_sign(sh+53, sh, 53) != 0) { close(conn); return -1; }
+	if(ed_sign(sh+53, sh, 53) != 0) { kill_sock(conn); return; }
 	print_timestamp();
 	printf("CONN: %s ... ", addrstr);
 	fflush(stdout);
-	if(send_frame(conn, FT_SH, sh, 117) < 0) { close(conn); printf("rejected!\n"); return 0; }
+	if(send_frame(conn, FT_SH, sh, 117) < 0) { printf("rejected!\n"); fflush(stdout); kill_sock(conn); return; }
+	/* The only blocking read: a peer that never sends a client
+	   hello is killed after HELLO_WAIT_MS. */
 	unsigned char ftype;
 	unsigned char ch[65];
 	size_t plen = 0;
-	if(recv_frame(conn, &ftype, ch, 65, &plen) < 0 || ftype != FT_CH || plen != 65) {
-		printf("rejected!\n"); close(conn); return 0;
-	}
-	{
-		struct timeval tv;
-		tv.tv_sec = 0; tv.tv_usec = 0;
-		setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+	if(wait_frame(conn, HELLO_WAIT_MS, &ftype, ch, 65, &plen) != 0 || ftype != FT_CH || plen != 65) {
+		printf("rejected!\n");
+		fflush(stdout);
+		kill_sock(conn);
+		return;
 	}
 	const unsigned char *eph_c = ch;
 	unsigned char req = ch[32];
 	const unsigned char *mac = ch + 33;
-	if(req > 2) { send_error_close(conn, 1); printf("rejected!\n"); close(conn); return 0; }
+	if(req > 2) { printf("rejected!\n"); fflush(stdout); kill_sock(conn); return; }
 	unsigned char shared[32], thash[32], expect_mac[32];
 	x25519_mul(shared, eph_sk, eph_c);
 	transcript_hash(eph_pk, eph_c, cap, nonce, req, thash);
 	auth_mac(shared, thash, req, expect_mac);
 	if(!ct_equal((char*)mac, (char*)expect_mac, 32)) {
-		send_error_close(conn, 3);
-		printf("rejected!\n"); close(conn); return 0;
+		printf("rejected!\n");
+		fflush(stdout);
+		kill_sock(conn);
+		return;
 	}
 	memset(eph_sk, 0, sizeof eph_sk);
 	opt_sock(conn);
+	{
+		/* Keepalive is on, so drop the handshake send timeout. */
+		struct timeval tv;
+		tv.tv_sec = 0;
+		tv.tv_usec = 0;
+		setsockopt(conn, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+	}
 	if(req == 0) {
-		if(*control >= 0) { close(*control); }
-		if(*next_up >= 0) { close(*next_up); *next_up = -1; }
+		/* Reaching here means the peer holds the shared secret,
+		   so a takeover of a live control socket is the real
+		   client restarting. A port scanner cannot get here. */
+		if(*control >= 0) { printf("control takeover\n"); close(*control); }
+		if(*next_up >= 0) { kill_sock(*next_up); *next_up = -1; }
 		*control = conn;
 		ctl_init_from(shared, thash);
 		printf("OK (admin)\n");
 	} else {
 		int enc = (req == 2);
 		if(!enc && !g_allow_cleartext) {
-			send_error_close(conn, 1);
 			printf("rejected cleartext not allowed\n");
-			close(conn); return 0;
+			fflush(stdout);
+			kill_sock(conn);
+			memset(shared, 0, sizeof shared);
+			return;
 		}
 		printf("OK (tunnel%s)\n", enc ? " enc" : "");
-		if(*control < 0) close(conn);
-		else {
-			if(*next_up >= 0) close(*next_up);
-			*next_up = conn;
-			*next_enc = enc;
-			tun_init_from(shared, thash);
-		}
+		if(*next_up >= 0) kill_sock(*next_up);
+		*next_up = conn;
+		*next_enc = enc;
+		tun_init_from(shared, thash);
 	}
 	memset(shared, 0, sizeof shared);
 	fflush(stdout);
-	return 0;
+}
+
+/* Pair a live spare with a public connection and hand both to a
+   tunnel thread. */
+static void accept_public(int sc, int *control, int *next_up, int *next_enc, struct tunnel ***threads, size_t *nthreads, size_t *capthreads) {
+	union sockaddr_union addr;
+	socklen_t alen = sizeof addr;
+	int conn = accept(sc, (struct sockaddr*)&addr, &alen);
+	if(conn < 0) return;
+	char addrstr[64];
+	format_addr(&addr, addrstr, sizeof addrstr);
+	if(*next_up < 0 || !spare_alive(*next_up)) {
+		/* Never pair a dead spare: the public peer would hang on
+		   a tunnel that never opens. Reset it at once instead. */
+		if(*next_up >= 0) { kill_sock(*next_up); *next_up = -1; }
+		print_timestamp();
+		printf("CONN: %s refused, no spare\n", addrstr);
+		fflush(stdout);
+		kill_sock(conn);
+		return;
+	}
+	{
+		unsigned char msg[80];
+		int mlen = snprintf((char*)msg, sizeof msg, "CONN:%s", addrstr);
+		if(mlen < 0) mlen = 0;
+		if(mlen > (int)sizeof msg) mlen = sizeof msg;
+		ctr_crypt(&g_ctl_dn, msg, (size_t)mlen); /* control is server->client only: both ends use dn stream */
+		if(send_frame(*control, FT_CTRL, msg, (size_t)mlen) < 0) {
+			printf("lost control socket\n");
+			fflush(stdout);
+			close(*control);
+			*control = -1;
+			kill_sock(*next_up);
+			*next_up = -1;
+			kill_sock(conn);
+			return;
+		}
+	}
+	if(tunnel_add(threads, nthreads, capthreads, *next_up, conn, *next_enc) < 0) {
+		kill_sock(*next_up);
+		kill_sock(conn);
+		*next_up = -1;
+		return;
+	}
+	*next_up = -1;
 }
 
 static void server_doit(const char *up_ip, unsigned short up_port, const char *client_ip, unsigned short client_port) {
@@ -958,69 +1121,50 @@ static void server_doit(const char *up_ip, unsigned short up_port, const char *c
 	struct tunnel **threads = 0;
 	size_t nthreads = 0, capthreads = 0;
 	while(1) {
+		struct pollfd fds[4];
+		int r;
 		tunnel_reap(&threads, &nthreads);
-		if(control < 0) server_wait_conn_up(su, &control, &next_up, &next_enc, 0);
-		if(next_up < 0) server_wait_conn_up(su, &control, &next_up, &next_enc, 0);
-		if(control >= 0 && next_up >= 0) {
-			struct pollfd fds[3];
-			fds[0].fd = sc; fds[0].events = POLLIN; fds[0].revents = 0;
-			fds[1].fd = control; fds[1].events = POLLIN; fds[1].revents = 0;
-			fds[2].fd = next_up; fds[2].events = POLLIN; fds[2].revents = 0;
-			int r = poll(fds, 3, -1);
-			if(r < 0) {
-				if(errno == EINTR) continue;
-				continue;
-			}
-			/* python checks in order control, next_up, sc and does
-			   continue after one loss; replicate exactly. */
-			if(fds[1].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) {
-				printf("lost control socket\n");
-				fflush(stdout);
-				close(control);
-				control = -1;
-				continue;
-			}
-			if(fds[2].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) {
-				printf("lost spare upstream socket\n");
-				fflush(stdout);
-				close(next_up);
-				next_up = -1;
-				continue;
-			}
-			if(fds[0].revents & POLLIN) {
-				if(!spare_alive(next_up)) {
-					printf("lost spare upstream socket\n");
-					fflush(stdout);
-					close(next_up);
-					next_up = -1;
-					continue;
-				}
-				union sockaddr_union addr;
-				socklen_t alen = sizeof addr;
-				int conn = accept(sc, (struct sockaddr*)&addr, &alen);
-				if(conn < 0) continue;
-				char addrstr[64];
-				format_addr(&addr, addrstr, sizeof addrstr);
-				unsigned char msg[80];
-				int mlen = snprintf((char*)msg, sizeof msg, "CONN:%s", addrstr);
-				if(mlen < 0) mlen = 0;
-				if(mlen > (int)sizeof msg) mlen = sizeof msg;
-				ctr_crypt(&g_ctl_dn, msg, (size_t)mlen); /* control is server->client only: both ends use dn stream */
-				if(control < 0 || send_frame(control, FT_CTRL, msg, (size_t)mlen) < 0) {
-					close(conn);
-					continue;
-				}
-				if(tunnel_add(&threads, &nthreads, &capthreads, next_up, conn, next_enc) < 0) {
-					close(next_up); close(conn);
-					next_up = -1;
-					continue;
-				}
-				next_up = -1;
-			}
+		/* One poll over everything. No blocking accept, so the
+		   public port, the admin port and the control socket
+		   stay live while a spare is missing. */
+		fds[0].fd = su; fds[0].events = POLLIN; fds[0].revents = 0;
+		fds[1].fd = sc; fds[1].events = POLLIN; fds[1].revents = 0;
+		fds[2].fd = control; fds[2].events = POLLIN; fds[2].revents = 0;
+		fds[3].fd = next_up; fds[3].events = POLLIN; fds[3].revents = 0;
+		do { r = poll(fds, 4, -1); } while(r < 0 && errno == EINTR);
+		if(r < 0) continue;
+		/* Order matters. A dead control or spare is handled first,
+		   so a peer that arrives at the same moment never
+		   replaces a live control socket. */
+		if(fds[2].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) {
+			printf("lost control socket\n");
+			fflush(stdout);
+			if(control >= 0) close(control);
+			control = -1;
+			continue;
+		}
+		if(fds[3].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL)) {
+			printf("lost spare upstream socket\n");
+			fflush(stdout);
+			kill_sock(next_up);
+			next_up = -1;
+			continue;
+		}
+		if(fds[0].revents & POLLIN) {
+			union sockaddr_union addr;
+			socklen_t alen = sizeof addr;
+			int conn = accept(su, (struct sockaddr*)&addr, &alen);
+			if(conn < 0) continue;
+			if(next_up >= 0 && !spare_alive(next_up)) { kill_sock(next_up); next_up = -1; }
+			server_handshake(conn, &control, &next_up, &next_enc);
+			continue;
+		}
+		if(fds[1].revents & POLLIN) {
+			accept_public(sc, &control, &next_up, &next_enc, &threads, &nthreads, &capthreads);
+			continue;
 		}
 	}
 }
-
 static void usage(const char *prog) {
 	printf(
 		"usage: %s [options]\n"

@@ -125,11 +125,38 @@ connection is not killed.
 All sockets use TCP keepalive with probes every 30 seconds
 of idle time (5 second interval, 3 probes), so a silently
 dead peer is detected in about 45 seconds instead of the
-2 hour default. Before a spare socket is paired, both ends
-poll it with a zero timeout: a socket that already shows
-FIN or RST is dropped and re-armed instead of hanging the
-next tunnel. Readable data alone is not treated as death,
-since tunnel bytes can legitimately be in flight.
+2 hour default.
+
+The client and the server both run one poll loop. Neither
+end blocks in accept. The client polls the control socket
+and the spare socket together, and it re-arms the spare
+when the spare shows data, an error, or fails the death
+check every 5 seconds. The server polls the admin
+listener, the public listener, the control socket, and the
+spare socket together. As a result, the server services
+the public port while it has no spare, and it never stops
+watching the control socket.
+
+A public connection that arrives while no live spare
+exists is reset at once. The peer sees a failure, not a
+hang. A spare that already shows FIN or RST is dropped
+and re-armed before it is paired, so a dead spare never
+reaches a tunnel. Readable data alone is not treated as
+death on a spare that is about to be paired, since tunnel
+bytes can legitimately be in flight.
+
+Admin socket peers
+------------------
+Every peer that connects to the admin port gets a server
+hello and then a 1.5 second deadline for a valid client
+hello. A peer without the shared secret fails the MAC
+check and its socket is reset. A drive-by portscanner
+therefore only costs one handshake, and it never drops a
+live control socket. Only a peer that proves the shared
+secret can replace a live control socket, which is how a
+restarted client takes over. The handshake runs inside
+the main poll loop, so a scanner that stalls delays the
+loop by at most the hello deadline.
 
 Wire protocol nt02
 ------------------
